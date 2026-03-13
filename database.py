@@ -2,7 +2,7 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DATABASE_URL = os.getenv("DATABASE_URL", "DATABASE_PUBLIC_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "${{Postgres.DATABASE_URL}}")
 
 # Render free tier gives postgres:// — SQLAlchemy needs postgresql://
 if DATABASE_URL.startswith("postgres://"):

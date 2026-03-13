@@ -111,6 +111,7 @@ async def scheduled_scrape():
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
+print("Hello, World!")
 
 @app.get("/api/jobs", response_model=list[JobOut])
 def list_jobs(

@@ -139,14 +139,51 @@ def get_dice_key() -> str:
 
 # ── Dice Scraper ──────────────────────────────────────────────────────────────
 
+# US states and common US location keywords
+_US_STATES = {
+    "alabama","alaska","arizona","arkansas","california","colorado","connecticut",
+    "delaware","florida","georgia","hawaii","idaho","illinois","indiana","iowa",
+    "kansas","kentucky","louisiana","maine","maryland","massachusetts","michigan",
+    "minnesota","mississippi","missouri","montana","nebraska","nevada",
+    "new hampshire","new jersey","new mexico","new york","north carolina",
+    "north dakota","ohio","oklahoma","oregon","pennsylvania","rhode island",
+    "south carolina","south dakota","tennessee","texas","utah","vermont",
+    "virginia","washington","west virginia","wisconsin","wyoming",
+}
+_US_ABBREVS = {
+    "al","ak","az","ar","ca","co","ct","de","fl","ga","hi","id","il","in","ia",
+    "ks","ky","la","me","md","ma","mi","mn","ms","mo","mt","ne","nv","nh","nj",
+    "nm","ny","nc","nd","oh","ok","or","pa","ri","sc","sd","tn","tx","ut","vt",
+    "va","wa","wv","wi","wy","dc",
+}
+_US_KEYWORDS = {"united states", "usa", "us", "remote"}
+
+def _is_us_location(location: str) -> bool:
+    loc = location.strip().lower()
+    if any(kw in loc for kw in _US_KEYWORDS):
+        return True
+    if loc in _US_STATES or loc in _US_ABBREVS:
+        return True
+    # Check if location ends with a state abbrev like "San Francisco, CA"
+    parts = [p.strip().rstrip(".") for p in loc.replace(",", " ").split()]
+    if parts and parts[-1] in _US_ABBREVS:
+        return True
+    return False
+
+
 def scrape_dice(role: str, location: str, max_pages=3) -> list[dict]:
     api_key = get_dice_key()
     jobs = []
 
+    # Dice only supports US locations — use "Remote" for non-US searches
+    dice_location = location if _is_us_location(location) else "Remote"
+    if dice_location != location:
+        logger.info(f"Dice: non-US location '{location}' → searching '{dice_location}' instead")
+
     with httpx.Client(timeout=15, follow_redirects=True) as client:
         for page in range(1, max_pages + 1):
             url = (f"https://job-search-api.svc.dhigroupinc.com/v1/dice/jobs/search"
-                   f"?q={quote_plus(role)}&location={quote_plus(location)}"
+                   f"?q={quote_plus(role)}&location={quote_plus(dice_location)}"
                    f"&pageSize=20&page={page}&language=en")
 
             for attempt in range(MAX_RETRIES):

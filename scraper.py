@@ -8,7 +8,8 @@ Rate limiting:
   - Rotates User-Agent strings
   - Respects HTTP 429 with exponential backoff
 """
-
+import re
+import os
 import hashlib
 import random
 import time
@@ -70,6 +71,7 @@ def parse_dice_date(date_str: Optional[str]) -> Optional[str]:
 # ── Dice scraper ──────────────────────────────────────────────────────────────
 
 def scrape_dice(role: str, location: str, max_pages: int = 3) -> list[dict]:
+    api_key = get_dice_api_key()  # ← dynamic
     """
     Scrape Dice.com using their internal search API — more reliable than HTML parsing.
     """
@@ -87,7 +89,7 @@ def scrape_dice(role: str, location: str, max_pages: int = 3) -> list[dict]:
                 resp = client.get(url, headers={
                     "User-Agent": random.choice(USER_AGENTS),
                     "Accept": "application/json",
-                    "x-api-key": "1YAt0R9wBg4WfsF9VB2778F5CHLAPMVW3WAZcKd8",
+                    "x-api-key": api_key,
                 })
                 if resp.status_code == 429:
                     logger.warning("Dice API rate-limited — backing off 30s")
@@ -129,8 +131,45 @@ def scrape_dice(role: str, location: str, max_pages: int = 3) -> list[dict]:
 
 
 
+import re
 
+def get_dice_api_key() -> str:
+    """Fetch Dice's API key dynamically from their JS bundle."""
+    try:
+        with httpx.Client(timeout=10, follow_redirects=True) as client:
+            resp = client.get("https://www.dice.com", headers=get_headers())
+            soup = BeautifulSoup(resp.text, "html.parser")
 
+            scripts = soup.find_all("script", src=True)
+            bundle_url = None
+            for s in scripts:
+                src = s["src"]
+                if "_app" in src or "main" in src or "webpack" in src:
+                    bundle_url = src if src.startswith("http") else f"https://www.dice.com{src}"
+                    break
+
+            if not bundle_url:
+                logger.warning("Dice API key: no JS bundle found — using fallback")
+            else:
+                js = client.get(bundle_url, headers=get_headers()).text
+                match = re.search(r'x-api-key["\s:]+([A-Za-z0-9]{32,})', js)
+                if match:
+                    key = match.group(1)
+                    logger.info(f"Dice API key: fetched dynamically ✓ (starts with {key[:8]}...)")
+                    return key
+                else:
+                    logger.warning("Dice API key: regex found no match in JS bundle — using fallback")
+
+    except Exception as e:
+        logger.warning(f"Dice API key: dynamic fetch failed ({e}) — using fallback")
+
+    env_key = os.getenv("DICE_API_KEY")
+    if env_key:
+        logger.info("Dice API key: using DICE_API_KEY env var")
+        return env_key
+
+    logger.warning("Dice API key: using hardcoded default — consider setting DICE_API_KEY env var")
+    return "1YAt0R9wBg4WfsF9VB2778F5CHLAPMVW3WAZcKd8"
 # ── LinkedIn scraper ──────────────────────────────────────────────────────────
 
 def scrape_linkedin(role: str, location: str, max_pages: int = 3) -> list[dict]:

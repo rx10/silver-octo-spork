@@ -136,6 +136,7 @@ DICE_API_KEY_HARDCODED = "1YAt0R9wBg4WfsF9VB2778F5CHLAPMVW3WAZcKd8"
 
 # Module-level cache so we only sniff the key once per process.
 _cached_dice_api_key: Optional[str] = None
+_cached_dice_key_source: Optional[str] = None  # tracks which strategy won
 
 # Regex patterns for static JS extraction (fallback to browser interception).
 _API_KEY_PATTERNS = [
@@ -149,7 +150,7 @@ _API_KEY_PATTERNS = [
 
 # ── Strategy 1: headless browser interception ─────────────────────────────────
 
-def _intercept_key_via_browser(timeout_sec: int = 30) -> Optional[str]:
+def _intercept_key_via_browser(timeout_sec: int = 45) -> Optional[str]:
     """
     Launch a headless browser, navigate to a Dice search page,
     and capture the x-api-key header from the XHR to their search API.
@@ -172,11 +173,24 @@ def _intercept_key_via_browser(timeout_sec: int = 30) -> Optional[str]:
         nonlocal captured_key
         if captured_key:
             return
-        # Match any request heading to the Dice job search API
-        if "job-search-api" in request.url or "dhigroupinc.com" in request.url:
+        url_lower = request.url.lower()
+        if "job-search-api" in url_lower or "dhigroupinc.com" in url_lower:
             key = request.headers.get("x-api-key")
             if key and len(key) >= 30:
                 captured_key = key
+                logger.info(f"Dice API key: captured from request to {request.url[:80]}")
+
+    def _on_response(response):
+        nonlocal captured_key
+        if captured_key:
+            return
+        url_lower = response.url.lower()
+        if "job-search-api" in url_lower or "dhigroupinc.com" in url_lower:
+            # Sometimes the key is echoed back in response headers
+            key = response.headers.get("x-api-key")
+            if key and len(key) >= 30:
+                captured_key = key
+                logger.info(f"Dice API key: captured from response headers")
 
     try:
         with sync_playwright() as pw:
@@ -187,14 +201,61 @@ def _intercept_key_via_browser(timeout_sec: int = 30) -> Optional[str]:
             )
             page = context.new_page()
             page.on("request", _on_request)
+            page.on("response", _on_response)
 
-            # Navigate to a search page so the frontend fires its API call
-            search_url = "https://www.dice.com/jobs?q=software&location=US"
+            # Navigate to search page
+            search_url = "https://www.dice.com/jobs?q=software+engineer&location=United+States"
             logger.info(f"Dice API key: loading {search_url} in headless browser")
-            page.goto(search_url, wait_until="networkidle", timeout=timeout_sec * 1000)
+            page.goto(search_url, wait_until="domcontentloaded", timeout=timeout_sec * 1000)
 
-            # Give JS a bit more time if we haven't captured yet
+            # Wait for page to settle
+            page.wait_for_timeout(3000)
+
             if not captured_key:
+                # Interact to trigger client-side API calls:
+                # Scroll down to trigger lazy loading
+                logger.debug("Dice API key: scrolling to trigger API calls")
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                page.wait_for_timeout(2000)
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(2000)
+
+            if not captured_key:
+                # Try clicking on a search/filter to force a new API call
+                logger.debug("Dice API key: trying search interaction")
+                try:
+                    search_input = page.locator(
+                        "input[placeholder*='Search'], "
+                        "input[name*='q'], "
+                        "input[data-cy*='search'], "
+                        "input[aria-label*='Search']"
+                    ).first
+                    if search_input.is_visible(timeout=3000):
+                        search_input.click()
+                        search_input.fill("developer")
+                        page.keyboard.press("Enter")
+                        page.wait_for_timeout(5000)
+                except Exception:
+                    pass
+
+            if not captured_key:
+                # Try clicking pagination / "next page"
+                logger.debug("Dice API key: trying pagination click")
+                try:
+                    next_btn = page.locator(
+                        "a[aria-label*='next'], "
+                        "button[aria-label*='next'], "
+                        "a[data-cy*='page'], "
+                        "li.pagination-next a"
+                    ).first
+                    if next_btn.is_visible(timeout=2000):
+                        next_btn.click()
+                        page.wait_for_timeout(5000)
+                except Exception:
+                    pass
+
+            if not captured_key:
+                # Last resort: wait longer for any late network calls
                 page.wait_for_timeout(3000)
 
             browser.close()
@@ -304,15 +365,20 @@ def get_dice_api_key(*, force_refresh: bool = False) -> str:
       4. DICE_API_KEY environment variable
       5. Hardcoded fallback (loud warning)
     """
-    global _cached_dice_api_key
+    global _cached_dice_api_key, _cached_dice_key_source
 
     if _cached_dice_api_key and not force_refresh:
+        logger.info(
+            f"Dice API key: using cached key from [{_cached_dice_key_source}] "
+            f"({_cached_dice_api_key[:8]}…)"
+        )
         return _cached_dice_api_key
 
     # Strategy 1: browser interception
     key = _intercept_key_via_browser()
     if key:
         _cached_dice_api_key = key
+        _cached_dice_key_source = "browser_interception"
         return key
 
     # Strategy 2: static extraction
@@ -321,6 +387,7 @@ def get_dice_api_key(*, force_refresh: bool = False) -> str:
             key = _extract_key_static(client)
             if key:
                 _cached_dice_api_key = key
+                _cached_dice_key_source = "static_js_extraction"
                 return key
     except Exception as e:
         logger.warning(f"Dice API key: static extraction error ({e})")
@@ -330,6 +397,7 @@ def get_dice_api_key(*, force_refresh: bool = False) -> str:
     if env_key:
         logger.info("Dice API key: using DICE_API_KEY env var")
         _cached_dice_api_key = env_key
+        _cached_dice_key_source = "env_var"
         return env_key
 
     # Strategy 4: hardcoded
@@ -339,6 +407,7 @@ def get_dice_api_key(*, force_refresh: bool = False) -> str:
         "Set DICE_API_KEY env var or install playwright "
         "(pip install playwright && playwright install chromium)."
     )
+    _cached_dice_key_source = "hardcoded_fallback"
     return DICE_API_KEY_HARDCODED
 
 
@@ -650,48 +719,81 @@ def _extract_linkedin_salary(soup: BeautifulSoup) -> Optional[str]:
     Extract salary information from a LinkedIn job page or card.
     LinkedIn puts salary data in several possible locations.
     """
+    # ── HTML selectors (ordered by specificity) ───────────────────────
     selectors = [
         "div.salary-main-rail__data-body",
         "span.compensation__salary",
         "div.compensation__salary",
-        "div[class*='salary']",
-        "span[class*='compensation']",
         "div.job-details-jobs-unified-top-card__job-insight span",
+        "div[class*='salary']",
+        "span[class*='salary']",
+        "span[class*='compensation']",
+        "div[class*='Salary']",
+        "span[class*='Salary']",
     ]
     for sel in selectors:
         el = soup.select_one(sel)
         if el:
             text = el.get_text(strip=True)
-            # Only return if it looks like a salary (has $ or number)
             if "$" in text or any(c.isdigit() for c in text):
+                logger.debug(f"LinkedIn salary: found via selector '{sel}': {text[:60]}")
                 return text
 
-    # Also check the structured data (JSON-LD)
+    # ── JSON-LD structured data ───────────────────────────────────────
     for script in soup.select('script[type="application/ld+json"]'):
         try:
             ld = json.loads(script.string or "")
-            salary = ld.get("baseSalary") or ld.get("estimatedSalary")
-            if isinstance(salary, dict):
-                value = salary.get("value", {})
-                currency = salary.get("currency", "USD")
-                min_val = value.get("minValue") or value.get("value")
-                max_val = value.get("maxValue")
-                if min_val and max_val:
-                    return f"{currency} {min_val:,}–{max_val:,}"
-                elif min_val:
-                    return f"{currency} {min_val:,}"
-            elif isinstance(salary, list) and salary:
-                first = salary[0]
-                value = first.get("value", {})
-                currency = first.get("currency", "USD")
-                min_val = value.get("minValue") or value.get("value")
-                max_val = value.get("maxValue")
-                if min_val and max_val:
-                    return f"{currency} {min_val:,}–{max_val:,}"
-                elif min_val:
-                    return f"{currency} {min_val:,}"
-        except (json.JSONDecodeError, TypeError, AttributeError):
+
+            # Handle both single object and @graph format
+            items = [ld] if not isinstance(ld, list) else ld
+            if "@graph" in ld if isinstance(ld, dict) else False:
+                items = ld["@graph"]
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                salary = (
+                    item.get("baseSalary")
+                    or item.get("estimatedSalary")
+                    or item.get("salary")
+                )
+                if not salary:
+                    continue
+
+                # Normalize to list
+                salary_list = salary if isinstance(salary, list) else [salary]
+                for sal in salary_list:
+                    if not isinstance(sal, dict):
+                        continue
+                    value = sal.get("value", sal)
+                    if isinstance(value, dict):
+                        currency = sal.get("currency", "USD")
+                        min_val = value.get("minValue") or value.get("value")
+                        max_val = value.get("maxValue")
+                        unit = value.get("unitText", "")
+                        suffix = f"/{unit}" if unit else ""
+                        if min_val and max_val:
+                            result = f"{currency} {min_val:,.0f}–{max_val:,.0f}{suffix}"
+                            logger.debug(f"LinkedIn salary: found in JSON-LD: {result}")
+                            return result
+                        elif min_val:
+                            result = f"{currency} {min_val:,.0f}{suffix}"
+                            logger.debug(f"LinkedIn salary: found in JSON-LD: {result}")
+                            return result
+        except (json.JSONDecodeError, TypeError, AttributeError, ValueError):
             continue
+
+    # ── Fallback: scan all text for salary patterns ───────────────────
+    page_text = soup.get_text()
+    salary_pattern = re.search(
+        r'\$[\d,]+(?:\.\d{2})?\s*[-–/to]+\s*\$[\d,]+(?:\.\d{2})?'
+        r'(?:\s*(?:per\s+)?(?:year|yr|hour|hr|month|annually))?',
+        page_text, re.IGNORECASE,
+    )
+    if salary_pattern:
+        result = salary_pattern.group(0).strip()
+        logger.debug(f"LinkedIn salary: found via regex: {result}")
+        return result
 
     return None
 
@@ -699,18 +801,57 @@ def _extract_linkedin_salary(soup: BeautifulSoup) -> Optional[str]:
 def _extract_linkedin_description(soup: BeautifulSoup) -> Optional[str]:
     """Extract the job description text from a LinkedIn job detail page."""
     selectors = [
+        # Public (non-authenticated) job pages
         "div.show-more-less-html__markup",
         "div.description__text",
+        "section.show-more-less-html",
+        # Newer markup
+        "article.jobs-description__container",
+        "div.jobs-description-content__text",
+        "div.jobs-description__content",
+        # Generic fallbacks
         "section.description div",
         "div[class*='description'] div.core-section-container__content",
+        "div[class*='Description']",
+        "div[class*='description__text']",
+        "div[class*='job-description']",
     ]
     for sel in selectors:
         el = soup.select_one(sel)
         if el:
             text = el.get_text(separator=" ", strip=True)
-            if len(text) > 50:  # skip tiny fragments
+            if len(text) > 50:
+                logger.debug(
+                    f"LinkedIn description: found via '{sel}' "
+                    f"({len(text)} chars)"
+                )
                 return truncate_text(text, 500)
 
+    # ── JSON-LD fallback ──────────────────────────────────────────────
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            ld = json.loads(script.string or "")
+            desc = None
+            if isinstance(ld, dict):
+                desc = ld.get("description")
+            if isinstance(ld, list):
+                for item in ld:
+                    if isinstance(item, dict) and "description" in item:
+                        desc = item["description"]
+                        break
+            if desc and len(desc) > 50:
+                # Strip HTML tags if present
+                clean = BeautifulSoup(desc, "html.parser").get_text(
+                    separator=" ", strip=True
+                )
+                logger.debug(
+                    f"LinkedIn description: found in JSON-LD ({len(clean)} chars)"
+                )
+                return truncate_text(clean, 500)
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            continue
+
+    logger.debug("LinkedIn description: no match found on page")
     return None
 
 
@@ -732,7 +873,7 @@ def _fetch_linkedin_job_details(
         resp.raise_for_status()
 
     except httpx.HTTPError as e:
-        logger.debug(f"LinkedIn detail fetch failed: {url} — {e}")
+        logger.warning(f"LinkedIn detail fetch failed: {url} — {e}")
         return job
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -741,6 +882,8 @@ def _fetch_linkedin_job_details(
         desc = _extract_linkedin_description(soup)
         if desc:
             job["description"] = desc
+        else:
+            logger.info(f"LinkedIn detail: no description found at {url.split('/')[-1]}")
 
     if not job.get("salary"):
         salary = _extract_linkedin_salary(soup)
@@ -931,3 +1074,121 @@ def run_scrape(
 
     logger.info(f"run_scrape total unique: {len(all_jobs)}")
     return all_jobs
+
+
+# ── Diagnostics ───────────────────────────────────────────────────────────────
+
+def verify_dice_api_key() -> dict:
+    """
+    Diagnostic: test each API key extraction strategy independently
+    and report which ones work. Run this to debug key issues.
+
+    Returns a dict with the result of each strategy.
+
+    Usage:
+        python scraper.py --verify
+        # or in code:
+        from scraper import verify_dice_api_key
+        print(verify_dice_api_key())
+    """
+    results: dict = {
+        "browser_interception": None,
+        "static_js_extraction": None,
+        "env_var": None,
+        "hardcoded": DICE_API_KEY_HARDCODED,
+        "active_key": None,
+        "active_source": None,
+    }
+
+    # Test browser interception
+    logger.info("── Testing browser interception ──")
+    key = _intercept_key_via_browser()
+    if key:
+        results["browser_interception"] = f"{key[:8]}…{key[-4:]}"
+        logger.info(f"  ✓ Browser interception: {key[:8]}…{key[-4:]}")
+    else:
+        logger.info("  ✗ Browser interception: FAILED")
+
+    # Test static extraction
+    logger.info("── Testing static JS extraction ──")
+    try:
+        with httpx.Client(timeout=15, follow_redirects=True) as client:
+            key = _extract_key_static(client)
+            if key:
+                results["static_js_extraction"] = f"{key[:8]}…{key[-4:]}"
+                logger.info(f"  ✓ Static extraction: {key[:8]}…{key[-4:]}")
+            else:
+                logger.info("  ✗ Static extraction: FAILED")
+    except Exception as e:
+        logger.info(f"  ✗ Static extraction: ERROR ({e})")
+
+    # Test env var
+    logger.info("── Testing env var ──")
+    env_key = os.getenv("DICE_API_KEY")
+    if env_key:
+        results["env_var"] = f"{env_key[:8]}…{env_key[-4:]}"
+        logger.info(f"  ✓ DICE_API_KEY env var: {env_key[:8]}…{env_key[-4:]}")
+    else:
+        logger.info("  ✗ DICE_API_KEY env var: NOT SET")
+
+    # Test the actual key that would be used
+    logger.info("── Testing active key against Dice API ──")
+    active_key = get_dice_api_key(force_refresh=True)
+    results["active_key"] = f"{active_key[:8]}…{active_key[-4:]}"
+    results["active_source"] = _cached_dice_key_source
+    logger.info(
+        f"  Active key: {active_key[:8]}…{active_key[-4:]} "
+        f"(source: {_cached_dice_key_source})"
+    )
+
+    # Validate the active key with a test API call
+    logger.info("── Validating key with a test API call ──")
+    try:
+        with httpx.Client(timeout=10, follow_redirects=True) as client:
+            resp = client.get(
+                "https://job-search-api.svc.dhigroupinc.com/v1/dice/jobs/search"
+                "?q=test&countryCode=US&pageSize=1&page=1&language=en",
+                headers={
+                    "User-Agent": random.choice(USER_AGENTS),
+                    "Accept": "application/json",
+                    "x-api-key": active_key,
+                },
+            )
+            results["api_test_status"] = resp.status_code
+            if resp.status_code == 200:
+                data = resp.json()
+                count = len(data.get("data", []))
+                results["api_test_jobs"] = count
+                logger.info(f"  ✓ API call succeeded: HTTP 200, {count} job(s)")
+            elif resp.status_code in (401, 403):
+                logger.warning(f"  ✗ API call REJECTED: HTTP {resp.status_code} — key is expired/invalid")
+            else:
+                logger.warning(f"  ? API call returned HTTP {resp.status_code}")
+    except Exception as e:
+        results["api_test_status"] = f"ERROR: {e}"
+        logger.warning(f"  ✗ API call failed: {e}")
+
+    return results
+
+
+if __name__ == "__main__":
+    import sys
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)-7s %(name)s: %(message)s",
+    )
+
+    if "--verify" in sys.argv:
+        print("\n🔍 Running Dice API key diagnostics...\n")
+        results = verify_dice_api_key()
+        print("\n── Summary ──")
+        for k, v in results.items():
+            print(f"  {k}: {v}")
+    else:
+        print("Usage:")
+        print("  python scraper.py --verify    # Test API key extraction")
+        print()
+        print("Or import and use in your code:")
+        print("  from scraper import run_scrape, verify_dice_api_key")
+

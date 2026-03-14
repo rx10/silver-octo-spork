@@ -2,18 +2,20 @@
 Job Board API — FastAPI backend
 Endpoints:
   GET  /api/jobs          — list / search jobs
-  POST /api/scrape        — trigger a fresh scrape
+  POST /api/scrape        — trigger a fresh scrape (runs in background)
+  GET  /api/scrape/status — check if a scrape is running
   GET  /health            — health check
 Scheduler: APScheduler runs a scrape every 24 hours automatically.
 """
 
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
@@ -31,16 +33,23 @@ DEFAULT_LOCATION = os.getenv("SCRAPE_LOCATION", "California")
 
 scheduler = AsyncIOScheduler()
 
+# ── scrape state (lightweight in-memory tracker) ─────────────────────────────
+
+_scrape_lock = threading.Lock()
+_scrape_status: dict = {
+    "running": False,
+    "last_run": None,
+    "last_result": None,
+}
+
 
 # ── startup / shutdown ────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create tables
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables ready")
 
-    # Schedule automatic scrape every 24 hours
     scheduler.add_job(
         scheduled_scrape,
         trigger="interval",
@@ -59,7 +68,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Job Board API", version="1.0.0", lifespan=lifespan)
 
-# Allow Next.js dev server and production domain
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
     "http://localhost:3000,http://localhost:3001"
@@ -92,17 +100,58 @@ def upsert_jobs(db: Session, raw_jobs: list[dict]) -> int:
     return new_count
 
 
+def _do_scrape(role: str, location: str):
+    """
+    Run the scrape synchronously and persist results.
+    Used by both the background task and the scheduler.
+    """
+    global _scrape_status
+
+    if not _scrape_lock.acquire(blocking=False):
+        logger.info("Scrape already running — skipping")
+        return
+
+    try:
+        _scrape_status["running"] = True
+        logger.info(f"Scrape starting — role={role!r}, location={location!r}")
+
+        raw = run_scrape(role, location)
+
+        from database import SessionLocal
+        db = SessionLocal()
+        try:
+            new = upsert_jobs(db, raw)
+        finally:
+            db.close()
+
+        _scrape_status.update({
+            "running": False,
+            "last_run": datetime.utcnow().isoformat(),
+            "last_result": {
+                "scraped": len(raw),
+                "new": new,
+                "message": f"Scraped {len(raw)} jobs, {new} new added to database.",
+            },
+        })
+        logger.info(f"Scrape done — {len(raw)} scraped, {new} new")
+
+    except Exception as e:
+        _scrape_status.update({
+            "running": False,
+            "last_run": datetime.utcnow().isoformat(),
+            "last_result": {"error": str(e)},
+        })
+        logger.error(f"Scrape failed: {e}", exc_info=True)
+
+    finally:
+        _scrape_lock.release()
+
+
 async def scheduled_scrape():
     """Called by APScheduler every 24 hours."""
-    from database import SessionLocal
-    logger.info("Scheduled scrape starting…")
-    raw = run_scrape(DEFAULT_ROLE, DEFAULT_LOCATION)
-    db  = SessionLocal()
-    try:
-        new = upsert_jobs(db, raw)
-        logger.info(f"Scheduled scrape done — {len(raw)} scraped, {new} new")
-    finally:
-        db.close()
+    import asyncio
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _do_scrape, DEFAULT_ROLE, DEFAULT_LOCATION)
 
 
 # ── routes ────────────────────────────────────────────────────────────────────
@@ -112,6 +161,7 @@ def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
 print("Hello, World!")
+
 
 @app.get("/api/jobs", response_model=list[JobOut])
 def list_jobs(
@@ -141,19 +191,29 @@ def list_jobs(
 @app.post("/api/scrape", response_model=ScrapeResponse)
 def trigger_scrape(
     body: ScrapeRequest = ScrapeRequest(),
-    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
 ):
-    """Manually trigger a fresh scrape with optional role / location override."""
-    try:
-        raw = run_scrape(body.role, body.location)
-    except Exception as e:
-        logger.error(f"Scrape failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Scrape error: {str(e)}")
+    """
+    Trigger a fresh scrape. Runs in the background to avoid HTTP timeouts.
+    Returns immediately with a status message.
+    """
+    if _scrape_status["running"]:
+        return ScrapeResponse(
+            scraped=0,
+            new=0,
+            message="A scrape is already running. Check /api/scrape/status for progress.",
+        )
 
-    new = upsert_jobs(db, raw)
+    background_tasks.add_task(_do_scrape, body.role, body.location)
 
     return ScrapeResponse(
-        scraped=len(raw),
-        new=new,
-        message=f"Scraped {len(raw)} jobs, {new} new added to database.",
+        scraped=0,
+        new=0,
+        message="Scrape started in background. Check /api/scrape/status for results.",
     )
+
+
+@app.get("/api/scrape/status")
+def scrape_status():
+    """Check the current scrape status and last result."""
+    return _scrape_status

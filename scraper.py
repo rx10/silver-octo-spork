@@ -1,12 +1,41 @@
 """
 Scraper module — Dice.com + LinkedIn
-Uses httpx for requests and BeautifulSoup for parsing.
+Uses httpx for requests, BeautifulSoup for parsing,
+and (optionally) Playwright to intercept Dice's live API key.
+
+Setup (choose one):
+
+  # Option A — venv (recommended, avoids system conflicts)
+  python -m venv .venv
+  source .venv/bin/activate          # Linux/Mac
+  pip install httpx beautifulsoup4 lxml playwright
+  playwright install chromium
+
+  # Option B — system-wide (Arch / externally-managed envs)
+  pip install httpx beautifulsoup4 lxml playwright --break-system-packages
+  playwright install chromium
+
+  Playwright is optional — without it, the scraper still works via
+  static JS extraction + HTML fallback.
 
 Rate limiting:
   - Random delay between requests (1–3 s)
   - Rotates User-Agent strings
-  - Respects HTTP 429 with exponential backoff
+  - HTTP 429 → jittered exponential backoff
+
+Dice strategy:
+  1. Intercept the real x-api-key from Dice's own XHR via headless browser.
+  2. Fall back to regex extraction from JS bundles / inline scripts.
+  3. Fall back to DICE_API_KEY env var → hardcoded default.
+  4. If the API fails entirely, scrape Dice search HTML directly.
+
+LinkedIn strategy:
+  1. Scrape public search result cards for title/company/location.
+  2. Fetch individual job detail pages for description & salary.
+  3. Extract salary from JSON-LD structured data when available.
 """
+
+import json
 import re
 import os
 import hashlib
@@ -15,11 +44,14 @@ import time
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import quote_plus
 
 import httpx
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
+
+# ── shared utilities ──────────────────────────────────────────────────────────
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -29,6 +61,8 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
+
+MAX_RETRIES = 3
 
 
 def make_id(url: str) -> str:
@@ -48,7 +82,7 @@ def get_headers() -> dict:
 
 
 def truncate_text(text: str, max_len: int = 500) -> str:
-    """Truncate text at a word boundary, adding ellipsis if needed."""
+    """Truncate at a word boundary, adding ellipsis if trimmed."""
     if not text or len(text) <= max_len:
         return text or ""
     truncated = text[:max_len].rsplit(" ", 1)[0]
@@ -57,8 +91,8 @@ def truncate_text(text: str, max_len: int = 500) -> str:
 
 def parse_relative_date(date_str: Optional[str]) -> Optional[str]:
     """
-    Parse relative date strings like 'today', '3 days ago', 'yesterday',
-    as well as ISO-format date strings. Returns ISO date string or None.
+    Parse relative date strings ('today', '3 days ago', 'yesterday')
+    and ISO-format dates. Returns ISO date string or None.
     """
     if not date_str:
         return None
@@ -69,24 +103,18 @@ def parse_relative_date(date_str: Optional[str]) -> Optional[str]:
         return today.isoformat()
     if "yesterday" in date_str:
         return (today - timedelta(days=1)).isoformat()
-    if "day" in date_str:
-        try:
-            n = int("".join(filter(str.isdigit, date_str)))
-            return (today - timedelta(days=n)).isoformat()
-        except ValueError:
-            pass
-    if "week" in date_str:
-        try:
-            n = int("".join(filter(str.isdigit, date_str)) or "1")
-            return (today - timedelta(weeks=n)).isoformat()
-        except ValueError:
-            pass
-    if "month" in date_str:
-        try:
-            n = int("".join(filter(str.isdigit, date_str)) or "1")
-            return (today - timedelta(days=n * 30)).isoformat()
-        except ValueError:
-            pass
+
+    for unit, delta_fn in [
+        ("day",   lambda n: timedelta(days=n)),
+        ("week",  lambda n: timedelta(weeks=n)),
+        ("month", lambda n: timedelta(days=n * 30)),
+    ]:
+        if unit in date_str:
+            try:
+                n = int("".join(filter(str.isdigit, date_str)) or "1")
+                return (today - delta_fn(n)).isoformat()
+            except ValueError:
+                pass
 
     try:
         return datetime.fromisoformat(date_str.replace("Z", "+00:00")).date().isoformat()
@@ -102,55 +130,91 @@ def exponential_backoff(attempt: int, base: float = 5.0, cap: float = 120.0):
     time.sleep(delay)
 
 
-# ── Dice API key ──────────────────────────────────────────────────────────────
+# ── Dice API key extraction ───────────────────────────────────────────────────
 
 DICE_API_KEY_HARDCODED = "1YAt0R9wBg4WfsF9VB2778F5CHLAPMVW3WAZcKd8"
 
-# Patterns ordered from most specific to least specific.
-# Each is tried against every JS bundle found on the Dice homepage.
+# Module-level cache so we only sniff the key once per process.
+_cached_dice_api_key: Optional[str] = None
+
+# Regex patterns for static JS extraction (fallback to browser interception).
 _API_KEY_PATTERNS = [
-    # Exact header assignment:  "x-api-key": "KEY"  or  'x-api-key': 'KEY'
     re.compile(r"""["']x-api-key["']\s*[:=]\s*["']([A-Za-z0-9]{30,})["']"""),
-    # Generic config key:  apiKey: "KEY"  or  "apiKey": "KEY"
     re.compile(r"""["']?apiKey["']?\s*[:=]\s*["']([A-Za-z0-9]{30,})["']"""),
-    # Query-param style:  apiKey=KEY  or  x-api-key=KEY
     re.compile(r"""(?:apiKey|x-api-key)=([A-Za-z0-9]{30,})"""),
-    # Object property:  {api_key: "KEY"}  or  {API_KEY: "KEY"}
     re.compile(r"""["']?(?:api_key|API_KEY)["']?\s*[:=]\s*["']([A-Za-z0-9]{30,})["']"""),
-    # Catch-all for long alphanumeric strings assigned near "api" or "key" context
     re.compile(r"""api[^"']{0,30}["']([A-Za-z0-9]{35,45})["']""", re.IGNORECASE),
 ]
 
 
-def _find_bundle_urls(soup: BeautifulSoup) -> list[str]:
+# ── Strategy 1: headless browser interception ─────────────────────────────────
+
+def _intercept_key_via_browser(timeout_sec: int = 30) -> Optional[str]:
     """
-    Extract candidate JS bundle URLs from a Dice homepage.
-    Returns all script srcs that look like app/main/chunk bundles.
+    Launch a headless browser, navigate to a Dice search page,
+    and capture the x-api-key header from the XHR to their search API.
+
+    Requires:
+        pip install playwright && playwright install chromium
     """
-    candidates = []
-    for tag in soup.find_all("script", src=True):
-        src = tag["src"]
-        # Skip analytics / third-party / tiny vendor scripts
-        if any(skip in src.lower() for skip in ("gtm", "analytics", "google", "facebook", "hotjar")):
-            continue
-        # Prefer anything that looks like an app or chunk bundle
-        if any(hint in src.lower() for hint in ("_app", "main", "webpack", "chunk", "bundle", "index")):
-            full = src if src.startswith("http") else f"https://www.dice.com{src}"
-            candidates.append(full)
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.info(
+            "Dice API key: playwright not installed — skipping browser interception. "
+            "Install with: pip install playwright && playwright install chromium"
+        )
+        return None
 
-    # If no obvious bundles, try all first-party scripts as a last resort
-    if not candidates:
-        for tag in soup.find_all("script", src=True):
-            src = tag["src"]
-            if "dice.com" in src or src.startswith("/"):
-                full = src if src.startswith("http") else f"https://www.dice.com{src}"
-                candidates.append(full)
+    captured_key: Optional[str] = None
 
-    return candidates
+    def _on_request(request):
+        nonlocal captured_key
+        if captured_key:
+            return
+        # Match any request heading to the Dice job search API
+        if "job-search-api" in request.url or "dhigroupinc.com" in request.url:
+            key = request.headers.get("x-api-key")
+            if key and len(key) >= 30:
+                captured_key = key
 
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=random.choice(USER_AGENTS),
+                viewport={"width": 1280, "height": 800},
+            )
+            page = context.new_page()
+            page.on("request", _on_request)
+
+            # Navigate to a search page so the frontend fires its API call
+            search_url = "https://www.dice.com/jobs?q=software&location=US"
+            logger.info(f"Dice API key: loading {search_url} in headless browser")
+            page.goto(search_url, wait_until="networkidle", timeout=timeout_sec * 1000)
+
+            # Give JS a bit more time if we haven't captured yet
+            if not captured_key:
+                page.wait_for_timeout(3000)
+
+            browser.close()
+
+    except Exception as e:
+        logger.warning(f"Dice API key: browser interception failed ({e})")
+        return None
+
+    if captured_key:
+        logger.info(f"Dice API key: intercepted via browser ({captured_key[:8]}…)")
+    else:
+        logger.warning("Dice API key: browser loaded but no API request captured")
+
+    return captured_key
+
+
+# ── Strategy 2: static regex extraction from JS ──────────────────────────────
 
 def _extract_key_from_js(js_text: str) -> Optional[str]:
-    """Try every regex pattern against the JS text, return first match or None."""
+    """Try every regex pattern against JS text, return first match or None."""
     for pattern in _API_KEY_PATTERNS:
         match = pattern.search(js_text)
         if match:
@@ -158,194 +222,556 @@ def _extract_key_from_js(js_text: str) -> Optional[str]:
     return None
 
 
-def _extract_key_from_inline_scripts(soup: BeautifulSoup) -> Optional[str]:
-    """Check inline <script> blocks on the page (some SPAs inject config there)."""
+def _extract_key_static(client: httpx.Client) -> Optional[str]:
+    """
+    Fetch the Dice homepage and try to extract the API key from:
+      - __NEXT_DATA__ JSON blob
+      - Inline <script> tags
+      - External JS bundles
+    """
+    try:
+        resp = client.get("https://www.dice.com", headers=get_headers())
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"Dice API key: could not fetch homepage ({e})")
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # __NEXT_DATA__
+    nd = soup.find("script", id="__NEXT_DATA__")
+    if nd and nd.string:
+        key = _extract_key_from_js(nd.string)
+        if key:
+            logger.info(f"Dice API key: found in __NEXT_DATA__ ({key[:8]}…)")
+            return key
+
+    # Inline scripts
     for tag in soup.find_all("script", src=False):
         text = tag.string or ""
         if len(text) < 50:
             continue
         key = _extract_key_from_js(text)
         if key:
+            logger.info(f"Dice API key: found in inline script ({key[:8]}…)")
             return key
+
+    # External JS bundles
+    skip_keywords = ("gtm", "analytics", "google", "facebook", "hotjar")
+    bundle_hints = ("_app", "main", "webpack", "chunk", "bundle", "index")
+
+    bundle_urls: list[str] = []
+    for tag in soup.find_all("script", src=True):
+        src = tag["src"]
+        if any(s in src.lower() for s in skip_keywords):
+            continue
+        if any(h in src.lower() for h in bundle_hints):
+            full = src if src.startswith("http") else f"https://www.dice.com{src}"
+            bundle_urls.append(full)
+
+    if not bundle_urls:
+        for tag in soup.find_all("script", src=True):
+            src = tag["src"]
+            if "dice.com" in src or src.startswith("/"):
+                full = src if src.startswith("http") else f"https://www.dice.com{src}"
+                bundle_urls.append(full)
+
+    logger.info(f"Dice API key: checking {len(bundle_urls)} JS bundle(s)")
+    for burl in bundle_urls:
+        try:
+            random_delay(0.3, 1.0)
+            js_resp = client.get(burl, headers=get_headers())
+            js_resp.raise_for_status()
+            key = _extract_key_from_js(js_resp.text)
+            if key:
+                logger.info(f"Dice API key: found in bundle ({key[:8]}…)")
+                return key
+        except httpx.HTTPError:
+            continue
+
+    logger.warning("Dice API key: static extraction found nothing")
     return None
 
 
-def _extract_key_from_nextdata(soup: BeautifulSoup) -> Optional[str]:
-    """Next.js apps often embed config in a __NEXT_DATA__ script tag."""
-    tag = soup.find("script", id="__NEXT_DATA__")
-    if tag and tag.string:
-        key = _extract_key_from_js(tag.string)
-        if key:
-            return key
-    return None
+# ── Combined key getter ───────────────────────────────────────────────────────
 
-
-def get_dice_api_key() -> str:
+def get_dice_api_key(*, force_refresh: bool = False) -> str:
     """
-    Attempt to dynamically extract Dice's API key from their frontend.
-
-    Strategy (in order):
-      1. Fetch dice.com homepage.
-      2. Check __NEXT_DATA__ / inline scripts for the key.
-      3. Fetch every candidate JS bundle and regex-search for the key.
-      4. Fall back to DICE_API_KEY env var.
-      5. Fall back to hardcoded default (with loud warning).
+    Get the Dice API key, trying (in order):
+      1. Module-level cache (skip with force_refresh=True)
+      2. Headless browser interception (most reliable)
+      3. Static regex extraction from JS bundles
+      4. DICE_API_KEY environment variable
+      5. Hardcoded fallback (loud warning)
     """
+    global _cached_dice_api_key
+
+    if _cached_dice_api_key and not force_refresh:
+        return _cached_dice_api_key
+
+    # Strategy 1: browser interception
+    key = _intercept_key_via_browser()
+    if key:
+        _cached_dice_api_key = key
+        return key
+
+    # Strategy 2: static extraction
     try:
         with httpx.Client(timeout=15, follow_redirects=True) as client:
-            resp = client.get("https://www.dice.com", headers=get_headers())
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            # ── Step 1: inline / __NEXT_DATA__ ────────────────────────────
-            key = _extract_key_from_nextdata(soup)
+            key = _extract_key_static(client)
             if key:
-                logger.info(f"Dice API key: found in __NEXT_DATA__ ({key[:8]}…)")
+                _cached_dice_api_key = key
                 return key
-
-            key = _extract_key_from_inline_scripts(soup)
-            if key:
-                logger.info(f"Dice API key: found in inline script ({key[:8]}…)")
-                return key
-
-            # ── Step 2: external JS bundles ────────────────────────────────
-            bundle_urls = _find_bundle_urls(soup)
-            if not bundle_urls:
-                logger.warning("Dice API key: no JS bundles found on homepage")
-            else:
-                logger.info(f"Dice API key: checking {len(bundle_urls)} JS bundle(s)")
-
-            for burl in bundle_urls:
-                try:
-                    random_delay(0.3, 1.0)
-                    js_resp = client.get(burl, headers=get_headers())
-                    js_resp.raise_for_status()
-                    js_text = js_resp.text
-                    logger.debug(f"  bundle {burl} — {len(js_text)} chars")
-
-                    key = _extract_key_from_js(js_text)
-                    if key:
-                        logger.info(f"Dice API key: extracted from bundle ({key[:8]}…)")
-                        return key
-                except httpx.HTTPError as e:
-                    logger.debug(f"  bundle fetch failed: {burl} — {e}")
-                    continue
-
-            logger.warning("Dice API key: exhausted all bundles, no key found")
-
     except Exception as e:
-        logger.warning(f"Dice API key: dynamic fetch failed ({e})")
+        logger.warning(f"Dice API key: static extraction error ({e})")
 
-    # ── Fallbacks ──────────────────────────────────────────────────────────
+    # Strategy 3: env var
     env_key = os.getenv("DICE_API_KEY")
     if env_key:
         logger.info("Dice API key: using DICE_API_KEY env var")
+        _cached_dice_api_key = env_key
         return env_key
 
+    # Strategy 4: hardcoded
     logger.warning(
-        "Dice API key: falling back to HARDCODED default. "
-        "This key may be expired — set DICE_API_KEY env var or fix dynamic extraction!"
+        "Dice API key: ALL dynamic methods failed. "
+        "Falling back to HARDCODED key — it is likely expired! "
+        "Set DICE_API_KEY env var or install playwright "
+        "(pip install playwright && playwright install chromium)."
     )
     return DICE_API_KEY_HARDCODED
 
 
-# ── Dice scraper ──────────────────────────────────────────────────────────────
+# ── Dice HTML scraper (no API key needed) ─────────────────────────────────────
 
-MAX_RETRIES = 3
+def _dig_for_jobs(obj, depth: int = 0) -> Optional[list]:
+    """
+    Recursively search a nested dict/list (parsed __NEXT_DATA__) for
+    what looks like a list of job result objects.
+    """
+    if depth > 8:
+        return None
+    if isinstance(obj, list) and len(obj) > 2:
+        if all(isinstance(x, dict) and "title" in x for x in obj[:3]):
+            return obj
+    if isinstance(obj, dict):
+        for key in ("data", "jobs", "results", "searchResults", "jobResults"):
+            if key in obj:
+                found = _dig_for_jobs(obj[key], depth + 1)
+                if found:
+                    return found
+        for val in obj.values():
+            found = _dig_for_jobs(val, depth + 1)
+            if found:
+                return found
+    return None
 
 
-def scrape_dice(role: str, location: str, max_pages: int = 3) -> list[dict]:
-    """Scrape Dice.com using their internal search API."""
-    api_key = get_dice_api_key()
+def _scrape_dice_html(
+    role: str, location: str, max_pages: int, client: httpx.Client,
+) -> list[dict]:
+    """
+    Scrape Dice job search results directly from the rendered HTML.
+    Works without an API key — uses the public search page.
+    """
     jobs: list[dict] = []
+    logger.info("Dice HTML fallback: starting")
 
-    with httpx.Client(timeout=15, follow_redirects=True) as client:
-        page = 1
-        while page <= max_pages:
-            url = (
-                f"https://job-search-api.svc.dhigroupinc.com/v1/dice/jobs/search"
-                f"?q={role.replace(' ', '+')}&countryCode=US"
-                f"&location={location.replace(' ', '+')}"
-                f"&pageSize=20&page={page}&language=en"
-            )
+    for page_num in range(1, max_pages + 1):
+        url = (
+            f"https://www.dice.com/jobs"
+            f"?q={quote_plus(role)}&location={quote_plus(location)}"
+            f"&page={page_num}&countryCode=US&language=en"
+        )
 
-            success = False
-            for attempt in range(MAX_RETRIES):
-                try:
-                    random_delay()
-                    resp = client.get(url, headers={
-                        "User-Agent": random.choice(USER_AGENTS),
-                        "Accept": "application/json",
-                        "x-api-key": api_key,
-                    })
-
-                    if resp.status_code == 429:
-                        logger.warning(f"Dice API rate-limited on page {page}")
-                        exponential_backoff(attempt)
-                        continue
-
-                    if resp.status_code in (401, 403):
-                        logger.error(
-                            f"Dice API auth error ({resp.status_code}) — "
-                            f"API key is likely expired"
-                        )
-                        return jobs
-
-                    resp.raise_for_status()
-                    data = resp.json()
-                    success = True
-                    break
-
-                except httpx.HTTPError as e:
-                    logger.error(f"Dice API HTTP error on page {page}, attempt {attempt + 1}: {e}")
+        success = False
+        resp = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                random_delay()
+                resp = client.get(url, headers=get_headers())
+                if resp.status_code == 429:
+                    logger.warning(f"Dice HTML rate-limited on page {page_num}")
                     exponential_backoff(attempt)
-
-            if not success:
-                logger.error(f"Dice page {page}: all {MAX_RETRIES} retries exhausted, stopping")
+                    continue
+                resp.raise_for_status()
+                success = True
                 break
+            except httpx.HTTPError as e:
+                logger.error(f"Dice HTML page {page_num}, attempt {attempt + 1}: {e}")
+                exponential_backoff(attempt)
 
-            hits = data.get("data", [])
-            if not hits:
-                logger.info(f"Dice page {page}: no results, stopping")
-                break
+        if not success or resp is None:
+            logger.error(f"Dice HTML page {page_num}: retries exhausted, stopping")
+            break
 
-            for item in hits:
-                try:
-                    job_url = (
-                        item.get("detailsPageUrl")
-                        or f"https://www.dice.com/job-detail/{item.get('guid', '')}"
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # ── Try __NEXT_DATA__ for structured job data ─────────────────
+        next_data = soup.find("script", id="__NEXT_DATA__")
+        if next_data and next_data.string:
+            try:
+                nd_json = json.loads(next_data.string)
+                search_results = _dig_for_jobs(nd_json)
+                if search_results:
+                    for item in search_results:
+                        try:
+                            job_url = (
+                                item.get("detailsPageUrl")
+                                or item.get("url")
+                                or f"https://www.dice.com/job-detail/"
+                                   f"{item.get('id', item.get('guid', ''))}"
+                            )
+                            if not job_url.startswith("http"):
+                                job_url = f"https://www.dice.com{job_url}"
+                            jobs.append({
+                                "id":          make_id(job_url),
+                                "title":       item.get("title", ""),
+                                "company":     item.get("companyName", "Unknown"),
+                                "location":    (
+                                    item.get("jobLocation", {}).get("displayName")
+                                    if isinstance(item.get("jobLocation"), dict)
+                                    else item.get("location", location)
+                                ),
+                                "posted_date": parse_relative_date(
+                                    item.get("postedDate")
+                                ),
+                                "description": truncate_text(
+                                    item.get("summary") or "", 500
+                                ),
+                                "salary":      item.get("salary"),
+                                "url":         job_url,
+                                "source":      "Dice",
+                            })
+                        except Exception as e:
+                            logger.warning(
+                                f"Dice HTML __NEXT_DATA__ item error: {e}"
+                            )
+                    logger.info(
+                        f"Dice HTML page {page_num}: {len(search_results)} "
+                        f"jobs from __NEXT_DATA__"
                     )
-                    jobs.append({
-                        "id":          make_id(job_url),
-                        "title":       item.get("title", ""),
-                        "company":     item.get("companyName", "Unknown"),
-                        "location":    (
-                            item.get("jobLocation", {}).get("displayName") or location
-                        ),
-                        "posted_date": parse_relative_date(item.get("postedDate")),
-                        "description": truncate_text(item.get("summary") or "", 500),
-                        "salary":      item.get("salary"),
-                        "url":         job_url,
-                        "source":      "Dice",
-                    })
-                except Exception as e:
-                    logger.warning(f"Dice item parse error: {e}")
+                    continue
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.debug(f"Dice HTML __NEXT_DATA__ parse failed: {e}")
+
+        # ── Parse visible HTML job cards ──────────────────────────────
+        cards = (
+            soup.select("a[data-cy='card-title-link']")
+            or soup.select("a.card-title-link")
+            or soup.select("[class*='JobCard'] a")
+            or soup.select("div.search-card a[href*='/job-detail/']")
+        )
+
+        if not cards:
+            cards = soup.select("a[href*='/job-detail/']")
+
+        if not cards:
+            logger.info(f"Dice HTML page {page_num}: no job cards found, stopping")
+            break
+
+        seen_on_page: set[str] = set()
+        for link in cards:
+            try:
+                href = link.get("href", "")
+                if "/job-detail/" not in href:
+                    continue
+                if not href.startswith("http"):
+                    href = f"https://www.dice.com{href}"
+                href = href.split("?")[0]
+                if href in seen_on_page:
+                    continue
+                seen_on_page.add(href)
+
+                title = link.get_text(strip=True)
+                if not title:
                     continue
 
-            logger.info(f"Dice page {page}: scraped {len(hits)} jobs")
-            page += 1
+                parent = link.find_parent("div") or link.find_parent("li")
+                company = "Unknown"
+                loc_text = location
+                if parent:
+                    co_el = (
+                        parent.select_one(
+                            "[data-cy='search-result-company-name']"
+                        )
+                        or parent.select_one("[class*='company']")
+                    )
+                    if co_el:
+                        company = co_el.get_text(strip=True)
+                    loc_el = (
+                        parent.select_one(
+                            "[data-cy='search-result-location']"
+                        )
+                        or parent.select_one("[class*='location']")
+                    )
+                    if loc_el:
+                        loc_text = loc_el.get_text(strip=True)
 
-    logger.info(f"Dice total: {len(jobs)} jobs")
+                jobs.append({
+                    "id":          make_id(href),
+                    "title":       title,
+                    "company":     company,
+                    "location":    loc_text,
+                    "posted_date": None,
+                    "description": None,
+                    "salary":      None,
+                    "url":         href,
+                    "source":      "Dice",
+                })
+            except Exception as e:
+                logger.warning(f"Dice HTML card parse error: {e}")
+                continue
+
+        logger.info(f"Dice HTML page {page_num}: scraped {len(seen_on_page)} jobs")
+
+    logger.info(f"Dice HTML fallback total: {len(jobs)} jobs")
     return jobs
+
+
+# ── Dice API scraper ──────────────────────────────────────────────────────────
+
+def _scrape_dice_api(
+    role: str, location: str, max_pages: int,
+    api_key: str, client: httpx.Client,
+) -> list[dict]:
+    """Scrape Dice via their internal search API. Returns [] on auth failure."""
+    jobs: list[dict] = []
+
+    page = 1
+    while page <= max_pages:
+        url = (
+            f"https://job-search-api.svc.dhigroupinc.com/v1/dice/jobs/search"
+            f"?q={quote_plus(role)}&countryCode=US"
+            f"&location={quote_plus(location)}"
+            f"&pageSize=20&page={page}&language=en"
+        )
+
+        success = False
+        data = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                random_delay()
+                resp = client.get(url, headers={
+                    "User-Agent": random.choice(USER_AGENTS),
+                    "Accept": "application/json",
+                    "x-api-key": api_key,
+                })
+
+                if resp.status_code == 429:
+                    logger.warning(f"Dice API rate-limited on page {page}")
+                    exponential_backoff(attempt)
+                    continue
+
+                if resp.status_code in (401, 403):
+                    logger.error(
+                        f"Dice API auth error ({resp.status_code}) — "
+                        f"key expired, switching to HTML fallback"
+                    )
+                    return jobs  # caller will try HTML fallback
+
+                resp.raise_for_status()
+                data = resp.json()
+                success = True
+                break
+
+            except httpx.HTTPError as e:
+                logger.error(
+                    f"Dice API error page {page}, attempt {attempt + 1}: {e}"
+                )
+                exponential_backoff(attempt)
+
+        if not success:
+            logger.error(
+                f"Dice API page {page}: retries exhausted, stopping"
+            )
+            break
+
+        hits = data.get("data", [])
+        if not hits:
+            logger.info(f"Dice API page {page}: no results, stopping")
+            break
+
+        for item in hits:
+            try:
+                job_url = (
+                    item.get("detailsPageUrl")
+                    or f"https://www.dice.com/job-detail/{item.get('guid', '')}"
+                )
+                jobs.append({
+                    "id":          make_id(job_url),
+                    "title":       item.get("title", ""),
+                    "company":     item.get("companyName", "Unknown"),
+                    "location":    (
+                        item.get("jobLocation", {}).get("displayName")
+                        or location
+                    ),
+                    "posted_date": parse_relative_date(item.get("postedDate")),
+                    "description": truncate_text(
+                        item.get("summary") or "", 500
+                    ),
+                    "salary":      item.get("salary"),
+                    "url":         job_url,
+                    "source":      "Dice",
+                })
+            except Exception as e:
+                logger.warning(f"Dice API item parse error: {e}")
+                continue
+
+        logger.info(f"Dice API page {page}: scraped {len(hits)} jobs")
+        page += 1
+
+    logger.info(f"Dice API total: {len(jobs)} jobs")
+    return jobs
+
+
+# ── Dice entry point (API → HTML fallback) ────────────────────────────────────
+
+def scrape_dice(role: str, location: str, max_pages: int = 3) -> list[dict]:
+    """
+    Scrape Dice.com. Tries the JSON API first; if the key is bad or the
+    API returns zero results, falls back to scraping the HTML search page.
+    """
+    with httpx.Client(timeout=15, follow_redirects=True) as client:
+        api_key = get_dice_api_key()
+        jobs = _scrape_dice_api(role, location, max_pages, api_key, client)
+
+        if jobs:
+            return jobs
+
+        logger.info("Dice API returned 0 jobs — trying HTML fallback")
+        return _scrape_dice_html(role, location, max_pages, client)
+
+
+# ── LinkedIn helpers ───────────────────────────────────────────────────────────
+
+def _extract_linkedin_salary(soup: BeautifulSoup) -> Optional[str]:
+    """
+    Extract salary information from a LinkedIn job page or card.
+    LinkedIn puts salary data in several possible locations.
+    """
+    selectors = [
+        "div.salary-main-rail__data-body",
+        "span.compensation__salary",
+        "div.compensation__salary",
+        "div[class*='salary']",
+        "span[class*='compensation']",
+        "div.job-details-jobs-unified-top-card__job-insight span",
+    ]
+    for sel in selectors:
+        el = soup.select_one(sel)
+        if el:
+            text = el.get_text(strip=True)
+            # Only return if it looks like a salary (has $ or number)
+            if "$" in text or any(c.isdigit() for c in text):
+                return text
+
+    # Also check the structured data (JSON-LD)
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            ld = json.loads(script.string or "")
+            salary = ld.get("baseSalary") or ld.get("estimatedSalary")
+            if isinstance(salary, dict):
+                value = salary.get("value", {})
+                currency = salary.get("currency", "USD")
+                min_val = value.get("minValue") or value.get("value")
+                max_val = value.get("maxValue")
+                if min_val and max_val:
+                    return f"{currency} {min_val:,}–{max_val:,}"
+                elif min_val:
+                    return f"{currency} {min_val:,}"
+            elif isinstance(salary, list) and salary:
+                first = salary[0]
+                value = first.get("value", {})
+                currency = first.get("currency", "USD")
+                min_val = value.get("minValue") or value.get("value")
+                max_val = value.get("maxValue")
+                if min_val and max_val:
+                    return f"{currency} {min_val:,}–{max_val:,}"
+                elif min_val:
+                    return f"{currency} {min_val:,}"
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            continue
+
+    return None
+
+
+def _extract_linkedin_description(soup: BeautifulSoup) -> Optional[str]:
+    """Extract the job description text from a LinkedIn job detail page."""
+    selectors = [
+        "div.show-more-less-html__markup",
+        "div.description__text",
+        "section.description div",
+        "div[class*='description'] div.core-section-container__content",
+    ]
+    for sel in selectors:
+        el = soup.select_one(sel)
+        if el:
+            text = el.get_text(separator=" ", strip=True)
+            if len(text) > 50:  # skip tiny fragments
+                return truncate_text(text, 500)
+
+    return None
+
+
+def _fetch_linkedin_job_details(
+    client: httpx.Client, job: dict,
+) -> dict:
+    """
+    Fetch a single LinkedIn job detail page to fill in description and salary.
+    Returns the updated job dict. On failure, returns the original unchanged.
+    """
+    url = job["url"]
+    try:
+        random_delay(2.0, 5.0)
+        resp = client.get(url, headers=get_headers())
+
+        if resp.status_code in (429, 999):
+            logger.warning(f"LinkedIn detail rate-limited: {url}")
+            return job
+        resp.raise_for_status()
+
+    except httpx.HTTPError as e:
+        logger.debug(f"LinkedIn detail fetch failed: {url} — {e}")
+        return job
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    if not job.get("description"):
+        desc = _extract_linkedin_description(soup)
+        if desc:
+            job["description"] = desc
+
+    if not job.get("salary"):
+        salary = _extract_linkedin_salary(soup)
+        if salary:
+            job["salary"] = salary
+
+    return job
 
 
 # ── LinkedIn scraper ──────────────────────────────────────────────────────────
 
-def scrape_linkedin(role: str, location: str, max_pages: int = 3) -> list[dict]:
-    """Scrape LinkedIn public job listings (no login required)."""
+def scrape_linkedin(
+    role: str,
+    location: str,
+    max_pages: int = 3,
+    fetch_details: bool = True,
+    max_detail_fetches: int = 15,
+) -> list[dict]:
+    """
+    Scrape LinkedIn public job listings (no login required).
+
+    Args:
+        role:               Job title / keywords.
+        location:           Location string.
+        max_pages:          Max search result pages to scrape.
+        fetch_details:      If True, fetch individual job pages for
+                            description & salary (slower but richer data).
+        max_detail_fetches: Cap on how many detail pages to fetch to
+                            avoid hammering LinkedIn.
+    """
     jobs: list[dict] = []
-    role_slug = role.replace(" ", "%20")
-    loc_slug  = location.replace(" ", "%20")
 
     with httpx.Client(timeout=20, follow_redirects=True) as client:
         page = 0
@@ -353,10 +779,12 @@ def scrape_linkedin(role: str, location: str, max_pages: int = 3) -> list[dict]:
             start = page * 25
             url = (
                 f"https://www.linkedin.com/jobs/search/"
-                f"?keywords={role_slug}&location={loc_slug}&start={start}"
+                f"?keywords={quote_plus(role)}"
+                f"&location={quote_plus(location)}&start={start}"
             )
 
             success = False
+            resp = None
             for attempt in range(MAX_RETRIES):
                 try:
                     random_delay(2.0, 4.5)
@@ -372,11 +800,16 @@ def scrape_linkedin(role: str, location: str, max_pages: int = 3) -> list[dict]:
                     break
 
                 except httpx.HTTPError as e:
-                    logger.error(f"LinkedIn HTTP error on page {page}, attempt {attempt + 1}: {e}")
+                    logger.error(
+                        f"LinkedIn HTTP error page {page}, "
+                        f"attempt {attempt + 1}: {e}"
+                    )
                     exponential_backoff(attempt, base=10.0)
 
-            if not success:
-                logger.error(f"LinkedIn page {page}: all retries exhausted, stopping")
+            if not success or resp is None:
+                logger.error(
+                    f"LinkedIn page {page}: retries exhausted, stopping"
+                )
                 break
 
             soup = BeautifulSoup(resp.text, "html.parser")
@@ -391,13 +824,17 @@ def scrape_linkedin(role: str, location: str, max_pages: int = 3) -> list[dict]:
 
             for card in cards:
                 try:
-                    title_el   = card.select_one("h3.base-search-card__title, h3")
-                    company_el = card.select_one("h4.base-search-card__subtitle, h4")
-                    loc_el     = card.select_one(
+                    title_el = card.select_one(
+                        "h3.base-search-card__title, h3"
+                    )
+                    company_el = card.select_one(
+                        "h4.base-search-card__subtitle, h4"
+                    )
+                    loc_el = card.select_one(
                         "span.job-search-card__location, span.location"
                     )
-                    date_el    = card.select_one("time")
-                    link_el    = card.select_one("a.base-card__full-link, a")
+                    date_el = card.select_one("time")
+                    link_el = card.select_one("a.base-card__full-link, a")
 
                     if not title_el or not link_el:
                         continue
@@ -413,18 +850,30 @@ def scrape_linkedin(role: str, location: str, max_pages: int = 3) -> list[dict]:
                             or parse_relative_date(date_el.get_text())
                         )
 
+                    # Try to grab salary from the search card itself
+                    card_salary = None
+                    salary_el = (
+                        card.select_one("span.job-search-card__salary-info")
+                        or card.select_one("div[class*='salary']")
+                        or card.select_one("span[class*='compensation']")
+                    )
+                    if salary_el:
+                        card_salary = salary_el.get_text(strip=True)
+
                     jobs.append({
                         "id":          make_id(href),
                         "title":       title_el.get_text(strip=True),
                         "company":     (
-                            company_el.get_text(strip=True) if company_el else "Unknown"
+                            company_el.get_text(strip=True)
+                            if company_el else "Unknown"
                         ),
                         "location":    (
-                            loc_el.get_text(strip=True) if loc_el else location
+                            loc_el.get_text(strip=True)
+                            if loc_el else location
                         ),
                         "posted_date": posted,
                         "description": None,
-                        "salary":      None,
+                        "salary":      card_salary,
                         "url":         href,
                         "source":      "LinkedIn",
                     })
@@ -434,6 +883,32 @@ def scrape_linkedin(role: str, location: str, max_pages: int = 3) -> list[dict]:
 
             logger.info(f"LinkedIn page {page}: scraped {len(cards)} cards")
             page += 1
+
+        # ── Fetch individual detail pages for description & salary ────
+        if fetch_details and jobs:
+            to_fetch = [
+                j for j in jobs
+                if not j.get("description") or not j.get("salary")
+            ][:max_detail_fetches]
+
+            logger.info(
+                f"LinkedIn: fetching details for {len(to_fetch)} / "
+                f"{len(jobs)} jobs"
+            )
+
+            for i, job in enumerate(to_fetch):
+                logger.debug(
+                    f"LinkedIn detail {i + 1}/{len(to_fetch)}: {job['url']}"
+                )
+                _fetch_linkedin_job_details(client, job)
+
+                # If we get rate-limited, stop fetching details
+                # (we already have the basic info from search cards)
+
+            filled = sum(1 for j in jobs if j.get("description"))
+            logger.info(
+                f"LinkedIn: {filled}/{len(jobs)} jobs now have descriptions"
+            )
 
     logger.info(f"LinkedIn total: {len(jobs)} jobs")
     return jobs
@@ -445,7 +920,7 @@ def run_scrape(
     role: str = "Software Developer",
     location: str = "California",
 ) -> list[dict]:
-    """Run both scrapers and merge results. Dedup by URL within this batch."""
+    """Run both scrapers and merge results. Dedup by URL."""
     all_jobs: list[dict] = []
     seen_urls: set[str]  = set()
 

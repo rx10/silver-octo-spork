@@ -16,7 +16,9 @@ from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 from sqlalchemy.orm import Session
 
 from database import Base, engine, get_db
@@ -68,27 +70,32 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Job Board API", version="1.0.0", lifespan=lifespan)
 
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:3000,http://localhost:3001"
-).split(",")
+# Custom CORS — always sends headers, even on 500/502
+class CORSAlways(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "OPTIONS":
+            return Response(status_code=200, headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Max-Age": "86400",
+            })
+        try:
+            response = await call_next(request)
+        except Exception:
+            response = Response(status_code=500, content="Internal Server Error")
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        return response
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSAlways)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def refresh_jobs(db: Session, raw_jobs: list[dict]) -> int:
-    """
-    Clear all existing jobs and insert the fresh batch.
-    Returns count of inserted rows.
-    """
+    """Clear all existing jobs and insert the fresh batch."""
     deleted = db.query(Job).delete()
     logger.info(f"Cleared {deleted} old jobs from database")
 
@@ -102,10 +109,7 @@ def refresh_jobs(db: Session, raw_jobs: list[dict]) -> int:
 
 
 def _do_scrape(role: str, location: str):
-    """
-    Run the scrape synchronously and persist results.
-    Used by both the background task and the scheduler.
-    """
+    """Run the scrape synchronously and persist results."""
     global _scrape_status
 
     if not _scrape_lock.acquire(blocking=False):
@@ -194,10 +198,7 @@ def trigger_scrape(
     body: ScrapeRequest = ScrapeRequest(),
     background_tasks: BackgroundTasks = BackgroundTasks(),
 ):
-    """
-    Trigger a fresh scrape. Runs in the background to avoid HTTP timeouts.
-    Returns immediately with a status message.
-    """
+    """Trigger a fresh scrape. Runs in background to avoid HTTP timeouts."""
     if _scrape_status["running"]:
         return ScrapeResponse(
             scraped=0,

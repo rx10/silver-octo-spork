@@ -106,14 +106,14 @@ def scrape_dice(role: str, location: str, max_pages: int = 3) -> list[dict]:
 
             for item in hits:
                 try:
-                    job_url = f"https://www.dice.com/job-detail/{item.get('id', '')}"
+                    job_url = item.get("detailsPageUrl") or f"https://www.dice.com/job-detail/{item.get('guid', '')}"
                     jobs.append({
                         "id":          make_id(job_url),
                         "title":       item.get("title", ""),
-                        "company":     item.get("companyPageUrl", {}).get("name") or item.get("companyDisplayName", "Unknown"),
-                        "location":    item.get("locationFormatted") or location,
+                        "company":     item.get("companyName", "Unknown"),
+                        "location":    item.get("jobLocation", {}).get("displayName") or location,
                         "posted_date": parse_dice_date(item.get("postedDate")),
-                        "description": (item.get("descriptionFragment") or "")[:500],
+                        "description": (item.get("summary") or "")[:500],
                         "salary":      item.get("salary"),
                         "url":         job_url,
                         "source":      "Dice",

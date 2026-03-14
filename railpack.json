@@ -4,11 +4,11 @@
   "steps": {
     "playwright": {
       "inputs": [{ "step": "install" }],
-      "commands": ["python -m playwright install --with-deps chromium"]
+      "commands": ["/app/.venv/bin/python -m playwright install --with-deps chromium"]
     }
   },
   "deploy": {
     "inputs": [{ "step": "playwright" }],
-    "startCommand": "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
+    "startCommand": "/app/.venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
   }
 }

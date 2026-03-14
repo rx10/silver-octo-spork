@@ -1,7 +1,6 @@
 """
 Scraper module — Dice.com + LinkedIn
 Uses httpx for requests and BeautifulSoup for parsing.
-Playwright is available as a fallback for JS-heavy pages (see comments).
 
 Rate limiting:
   - Random delay between requests (1–3 s)
@@ -33,7 +32,6 @@ USER_AGENTS = [
 
 
 def make_id(url: str) -> str:
-    """Deterministic job ID from URL hash — natural dedup key."""
     return hashlib.sha256(url.encode()).hexdigest()[:32]
 
 
@@ -50,7 +48,6 @@ def get_headers() -> dict:
 
 
 def parse_dice_date(date_str: Optional[str]) -> Optional[str]:
-    """Convert Dice relative dates ('2 days ago') to ISO date strings."""
     if not date_str:
         return None
     date_str = date_str.strip().lower()
@@ -65,16 +62,73 @@ def parse_dice_date(date_str: Optional[str]) -> Optional[str]:
             return (today - timedelta(days=n)).isoformat()
         except ValueError:
             pass
+    try:
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        pass
     return today.isoformat()
+
+
+# ── Dice API key ──────────────────────────────────────────────────────────────
+
+DICE_API_KEY_HARDCODED = "1YAt0R9wBg4WfsF9VB2778F5CHLAPMVW3WAZcKd8"
+
+
+def get_dice_api_key() -> str:
+    """
+    Try to fetch Dice's API key dynamically from their JS bundle.
+    Falls back to DICE_API_KEY env var, then hardcoded default.
+    """
+    try:
+        with httpx.Client(timeout=10, follow_redirects=True) as client:
+            resp = client.get("https://www.dice.com", headers=get_headers())
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            bundle_url = None
+            for s in soup.find_all("script", src=True):
+                src = s["src"]
+                if "_app" in src or "main" in src or "webpack" in src:
+                    bundle_url = src if src.startswith("http") else f"https://www.dice.com{src}"
+                    break
+
+            if not bundle_url:
+                logger.warning("Dice API key: no JS bundle found — trying fallback")
+            else:
+                logger.info(f"Dice API key: found bundle URL: {bundle_url}")
+                js = client.get(bundle_url, headers=get_headers()).text
+                logger.info(f"Dice API key: JS bundle size: {len(js)} chars")
+
+                patterns = [
+                    r'x-api-key["\s:]+([A-Za-z0-9]{32,})',
+                    r'"apiKey"\s*:\s*"([A-Za-z0-9]{32,})"',
+                    r'apiKey=([A-Za-z0-9]{32,})',
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, js)
+                    if match:
+                        key = match.group(1)
+                        logger.info(f"Dice API key: fetched dynamically (starts with {key[:8]}...)")
+                        return key
+
+                logger.warning("Dice API key: no match found in JS bundle — trying fallback")
+
+    except Exception as e:
+        logger.warning(f"Dice API key: dynamic fetch failed ({e}) — trying fallback")
+
+    env_key = os.getenv("DICE_API_KEY")
+    if env_key:
+        logger.info("Dice API key: using DICE_API_KEY env var")
+        return env_key
+
+    logger.warning("Dice API key: using hardcoded default — consider setting DICE_API_KEY env var")
+    return DICE_API_KEY_HARDCODED
 
 
 # ── Dice scraper ──────────────────────────────────────────────────────────────
 
 def scrape_dice(role: str, location: str, max_pages: int = 3) -> list[dict]:
-    api_key = get_dice_api_key()  # ← dynamic
-    """
-    Scrape Dice.com using their internal search API — more reliable than HTML parsing.
-    """
+    """Scrape Dice.com using their internal search API."""
+    api_key = get_dice_api_key()
     jobs = []
 
     with httpx.Client(timeout=15, follow_redirects=True) as client:
@@ -130,66 +184,10 @@ def scrape_dice(role: str, location: str, max_pages: int = 3) -> list[dict]:
     return jobs
 
 
-
-import re
-
-def get_dice_api_key() -> str:
-    """Fetch Dice's API key dynamically from their JS bundle."""
-    try:
-        with httpx.Client(timeout=10, follow_redirects=True) as client:
-            resp = client.get("https://www.dice.com", headers=get_headers())
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            scripts = soup.find_all("script", src=True)
-            bundle_url = None
-            for s in scripts:
-                src = s["src"]
-                if "_app" in src or "main" in src or "webpack" in src:
-                    bundle_url = src if src.startswith("http") else f"https://www.dice.com{src}"
-                    break
-
-if not bundle_url:
-    logger.warning("Dice API key: no JS bundle found — using fallback")
-else:
-    logger.info(f"Dice API key: found bundle URL: {bundle_url}")
-    js = client.get(bundle_url, headers=get_headers()).text
-    logger.info(f"Dice API key: JS bundle size: {len(js)} chars")
-    match = re.search(r'x-api-key["\s:]+([A-Za-z0-9]{32,})', js)
-    if match:
-        ...
-    else:
-        logger.warning("Dice API key: regex found no match — trying alternate patterns")
-        # try alternate patterns
-        for pattern in [r'"apiKey"\s*:\s*"([A-Za-z0-9]{32,})"', r'apiKey=([A-Za-z0-9]{32,})']:
-            m = re.search(pattern, js)
-            if m:
-                logger.info(f"Dice API key: found with alternate pattern: {m.group(1)[:8]}...")
-                return m.group(1)
-                
-    except Exception as e:
-        logger.warning(f"Dice API key: dynamic fetch failed ({e}) — using fallback")
-
-    env_key = os.getenv("DICE_API_KEY")
-    if env_key:
-        logger.info("Dice API key: using DICE_API_KEY env var")
-        return env_key
-
-    logger.warning("Dice API key: using hardcoded default — consider setting DICE_API_KEY env var")
-    return "1YAt0R9wBg4WfsF9VB2778F5CHLAPMVW3WAZcKd8"
 # ── LinkedIn scraper ──────────────────────────────────────────────────────────
 
 def scrape_linkedin(role: str, location: str, max_pages: int = 3) -> list[dict]:
-    """
-    Scrape LinkedIn public job listings (no login required for browsing).
-
-    LinkedIn is more aggressive with bot detection. This uses:
-      - Randomised User-Agent rotation
-      - Longer random delays
-      - The /jobs/search endpoint which returns static HTML
-
-    If LinkedIn blocks requests consistently, switch to Playwright with
-    stealth mode (playwright-stealth pip package).
-    """
+    """Scrape LinkedIn public job listings (no login required)."""
     jobs = []
     role_slug = role.replace(" ", "%20")
     loc_slug  = location.replace(" ", "%20")
@@ -202,7 +200,7 @@ def scrape_linkedin(role: str, location: str, max_pages: int = 3) -> list[dict]:
                 f"?keywords={role_slug}&location={loc_slug}&start={start}"
             )
             try:
-                time.sleep(random.uniform(2.0, 4.5))   # LinkedIn needs longer delays
+                time.sleep(random.uniform(2.0, 4.5))
                 resp = client.get(url, headers=get_headers())
                 if resp.status_code in (429, 999):
                     logger.warning("LinkedIn rate-limited — backing off 60s")
@@ -236,7 +234,6 @@ def scrape_linkedin(role: str, location: str, max_pages: int = 3) -> list[dict]:
                     if not href.startswith("http"):
                         continue
 
-                    # date from <time datetime="2026-03-10">
                     posted = None
                     if date_el:
                         posted = date_el.get("datetime") or parse_dice_date(date_el.get_text())
@@ -247,7 +244,7 @@ def scrape_linkedin(role: str, location: str, max_pages: int = 3) -> list[dict]:
                         "company":     company_el.get_text(strip=True) if company_el else "Unknown",
                         "location":    loc_el.get_text(strip=True)     if loc_el     else location,
                         "posted_date": posted,
-                        "description": None,   # LinkedIn hides full desc behind login
+                        "description": None,
                         "salary":      None,
                         "url":         href,
                         "source":      "LinkedIn",

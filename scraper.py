@@ -211,13 +211,16 @@ def scrape_dice(role: str, location: str, max_pages=3) -> list[dict]:
             if not hits:
                 break
 
+            is_remote_fallback = dice_location != location
+
             for item in hits:
                 job_url = item.get("detailsPageUrl") or f"https://www.dice.com/job-detail/{item.get('guid','')}"
+                raw_loc = item.get("jobLocation", {}).get("displayName") or dice_location
                 jobs.append({
                     "id":          make_id(job_url),
                     "title":       item.get("title", ""),
                     "company":     item.get("companyName", "Unknown"),
-                    "location":    item.get("jobLocation", {}).get("displayName") or location,
+                    "location":    "Remote" if is_remote_fallback else raw_loc,
                     "posted_date": parse_date(item.get("postedDate")),
                     "description": truncate(item.get("summary") or ""),
                     "salary":      item.get("salary"),

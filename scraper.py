@@ -148,18 +148,24 @@ def get_dice_api_key() -> str:
                     bundle_url = src if src.startswith("http") else f"https://www.dice.com{src}"
                     break
 
-            if not bundle_url:
-                logger.warning("Dice API key: no JS bundle found — using fallback")
-            else:
-                js = client.get(bundle_url, headers=get_headers()).text
-                match = re.search(r'x-api-key["\s:]+([A-Za-z0-9]{32,})', js)
-                if match:
-                    key = match.group(1)
-                    logger.info(f"Dice API key: fetched dynamically ✓ (starts with {key[:8]}...)")
-                    return key
-                else:
-                    logger.warning("Dice API key: regex found no match in JS bundle — using fallback")
-
+if not bundle_url:
+    logger.warning("Dice API key: no JS bundle found — using fallback")
+else:
+    logger.info(f"Dice API key: found bundle URL: {bundle_url}")
+    js = client.get(bundle_url, headers=get_headers()).text
+    logger.info(f"Dice API key: JS bundle size: {len(js)} chars")
+    match = re.search(r'x-api-key["\s:]+([A-Za-z0-9]{32,})', js)
+    if match:
+        ...
+    else:
+        logger.warning("Dice API key: regex found no match — trying alternate patterns")
+        # try alternate patterns
+        for pattern in [r'"apiKey"\s*:\s*"([A-Za-z0-9]{32,})"', r'apiKey=([A-Za-z0-9]{32,})']:
+            m = re.search(pattern, js)
+            if m:
+                logger.info(f"Dice API key: found with alternate pattern: {m.group(1)[:8]}...")
+                return m.group(1)
+                
     except Exception as e:
         logger.warning(f"Dice API key: dynamic fetch failed ({e}) — using fallback")
 

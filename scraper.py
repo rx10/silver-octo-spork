@@ -146,7 +146,7 @@ def scrape_dice(role: str, location: str, max_pages=3) -> list[dict]:
     with httpx.Client(timeout=15, follow_redirects=True) as client:
         for page in range(1, max_pages + 1):
             url = (f"https://job-search-api.svc.dhigroupinc.com/v1/dice/jobs/search"
-                   f"?q={quote_plus(role)}&countryCode=US&location={quote_plus(location)}"
+                   f"?q={quote_plus(role)}&location={quote_plus(location)}"
                    f"&pageSize=20&page={page}&language=en")
 
             for attempt in range(MAX_RETRIES):

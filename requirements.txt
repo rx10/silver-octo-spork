@@ -7,3 +7,4 @@ beautifulsoup4==4.13.3
 apscheduler==3.11.0
 python-dotenv==1.1.0
 pydantic==2.11.1
+playwright

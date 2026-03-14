@@ -71,113 +71,64 @@ def parse_dice_date(date_str: Optional[str]) -> Optional[str]:
 
 def scrape_dice(role: str, location: str, max_pages: int = 3) -> list[dict]:
     """
-    Scrape Dice.com job listings.
-    Dice renders results server-side, so plain httpx works.
-    If Dice switches to client-side rendering, swap the fetch below for
-    a Playwright page.goto() call.
+    Scrape Dice.com using their internal search API — more reliable than HTML parsing.
     """
     jobs = []
-    role_slug = role.replace(" ", "%20")
-    loc_slug  = location.replace(" ", "%20")
 
     with httpx.Client(timeout=15, follow_redirects=True) as client:
         for page in range(1, max_pages + 1):
             url = (
-                f"https://www.dice.com/jobs?q={role_slug}"
-                f"&location={loc_slug}&page={page}"
+                f"https://job-search-api.svc.dhigroupinc.com/v1/dice/jobs/search"
+                f"?q={role.replace(' ', '+')}&countryCode=US&location={location.replace(' ', '+')}"
+                f"&pageSize=20&page={page}&language=en"
             )
             try:
                 random_delay()
-                resp = client.get(url, headers=get_headers())
+                resp = client.get(url, headers={
+                    "User-Agent": random.choice(USER_AGENTS),
+                    "Accept": "application/json",
+                    "x-api-key": "1YAt0R9wBg4WfsF9VB2778F5CHLAPMVW3WAZcKd8",
+                })
                 if resp.status_code == 429:
-                    logger.warning("Dice rate-limited — backing off 30s")
+                    logger.warning("Dice API rate-limited — backing off 30s")
                     time.sleep(30)
-                    resp = client.get(url, headers=get_headers())
+                    continue
                 resp.raise_for_status()
-            except httpx.HTTPError as e:
-                logger.error(f"Dice HTTP error on page {page}: {e}")
+                data = resp.json()
+            except Exception as e:
+                logger.error(f"Dice API error on page {page}: {e}")
                 break
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Dice job cards — selector may need updating if Dice changes markup
-            cards = soup.select("div.card-title-wrapper") or \
-                    soup.select("[data-cy='card-title-link']") or \
-                    soup.select("a.card-title-link")
-
-            if not cards:
-                # Fallback: try JSON embedded in script tag
-                jobs += _parse_dice_json(soup, role, location)
-                if not jobs:
-                    logger.info(f"Dice page {page}: no cards found, stopping")
+            hits = data.get("data", [])
+            if not hits:
+                logger.info(f"Dice page {page}: no results, stopping")
                 break
 
-            for card in cards:
+            for item in hits:
                 try:
-                    title_el   = card.select_one("a.card-title-link, h5 a, .title")
-                    company_el = card.select_one("[data-cy='search-result-company-name'], .company-name")
-                    loc_el     = card.select_one("[data-cy='search-result-location'], .location")
-                    date_el    = card.select_one("[data-cy='card-posted-date'], .posted-date")
-                    salary_el  = card.select_one(".salary, [data-cy='search-result-salary']")
-                    desc_el    = card.select_one(".card-description, .job-description")
-
-                    if not title_el:
-                        continue
-
-                    href = title_el.get("href", "")
-                    job_url = href if href.startswith("http") else f"https://www.dice.com{href}"
-
+                    job_url = f"https://www.dice.com/job-detail/{item.get('id', '')}"
                     jobs.append({
                         "id":          make_id(job_url),
-                        "title":       title_el.get_text(strip=True),
-                        "company":     company_el.get_text(strip=True) if company_el else "Unknown",
-                        "location":    loc_el.get_text(strip=True)     if loc_el     else location,
-                        "posted_date": parse_dice_date(date_el.get_text() if date_el else None),
-                        "description": desc_el.get_text(strip=True)[:500] if desc_el else None,
-                        "salary":      salary_el.get_text(strip=True)  if salary_el  else None,
+                        "title":       item.get("title", ""),
+                        "company":     item.get("companyPageUrl", {}).get("name") or item.get("companyDisplayName", "Unknown"),
+                        "location":    item.get("locationFormatted") or location,
+                        "posted_date": parse_dice_date(item.get("postedDate")),
+                        "description": (item.get("descriptionFragment") or "")[:500],
+                        "salary":      item.get("salary"),
                         "url":         job_url,
                         "source":      "Dice",
                     })
                 except Exception as e:
-                    logger.warning(f"Dice card parse error: {e}")
+                    logger.warning(f"Dice item parse error: {e}")
                     continue
 
-            logger.info(f"Dice page {page}: scraped {len(cards)} cards")
+            logger.info(f"Dice page {page}: scraped {len(hits)} jobs")
 
     logger.info(f"Dice total: {len(jobs)} jobs")
     return jobs
 
 
-def _parse_dice_json(soup: BeautifulSoup, role: str, location: str) -> list[dict]:
-    """
-    Some Dice pages embed structured JSON in a <script type='application/json'> tag.
-    This is a fallback if the HTML card selectors above fail.
-    """
-    import json
-    jobs = []
-    for tag in soup.find_all("script", type="application/json"):
-        try:
-            data = json.loads(tag.string or "")
-            items = data.get("props", {}).get("pageProps", {}).get("initialState", {}) \
-                       .get("jobBoard", {}).get("searchResults", {}).get("hits", [])
-            for item in items:
-                url = item.get("applyLink") or item.get("jobLink") or ""
-                if not url:
-                    continue
-                jobs.append({
-                    "id":          make_id(url),
-                    "title":       item.get("title", ""),
-                    "company":     item.get("employerName", "Unknown"),
-                    "location":    item.get("location", location),
-                    "posted_date": parse_dice_date(item.get("formattedDate")),
-                    "description": (item.get("descriptionFragment") or "")[:500],
-                    "salary":      item.get("salaryRange"),
-                    "url":         url,
-                    "source":      "Dice",
-                })
-        except Exception:
-            continue
-    return jobs
+
 
 
 # ── LinkedIn scraper ──────────────────────────────────────────────────────────

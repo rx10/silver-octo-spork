@@ -84,20 +84,21 @@ app.add_middleware(
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def upsert_jobs(db: Session, raw_jobs: list[dict]) -> int:
+def refresh_jobs(db: Session, raw_jobs: list[dict]) -> int:
     """
-    Insert new jobs, skip duplicates (by primary key / URL hash).
-    Returns count of newly inserted rows.
+    Clear all existing jobs and insert the fresh batch.
+    Returns count of inserted rows.
     """
-    new_count = 0
+    deleted = db.query(Job).delete()
+    logger.info(f"Cleared {deleted} old jobs from database")
+
+    now = datetime.utcnow()
     for data in raw_jobs:
-        existing = db.get(Job, data["id"])
-        if existing:
-            continue
-        db.add(Job(**data, scraped_at=datetime.utcnow()))
-        new_count += 1
+        db.add(Job(**data, scraped_at=now))
+
     db.commit()
-    return new_count
+    logger.info(f"Inserted {len(raw_jobs)} fresh jobs")
+    return len(raw_jobs)
 
 
 def _do_scrape(role: str, location: str):
@@ -120,7 +121,7 @@ def _do_scrape(role: str, location: str):
         from database import SessionLocal
         db = SessionLocal()
         try:
-            new = upsert_jobs(db, raw)
+            new = refresh_jobs(db, raw)
         finally:
             db.close()
 
@@ -130,7 +131,7 @@ def _do_scrape(role: str, location: str):
             "last_result": {
                 "scraped": len(raw),
                 "new": new,
-                "message": f"Scraped {len(raw)} jobs, {new} new added to database.",
+                "message": f"Refreshed database with {len(raw)} latest jobs.",
             },
         })
         logger.info(f"Scrape done — {len(raw)} scraped, {new} new")

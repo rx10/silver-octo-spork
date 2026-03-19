@@ -591,78 +591,49 @@ def _scrape_linkedin_httpx_fallback(role, location, max_pages, max_details):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def scrape_indeed(role: str, location: str, max_pages=5) -> list[dict]:
-    """RSS first (~2 KB/page), HTML fallback. Proxy bypasses 403."""
+    """HTML scrape with proxy. RSS endpoint is defunct (404)."""
     jobs = []
     session_id = _new_session_id()
 
     with _httpx_client(sticky=session_id, timeout=20, follow_redirects=True) as c:
-
-        # Phase 1: RSS
-        for pg in range(max_pages):
-            rss_url = (
-                f"https://www.indeed.com/rss"
-                f"?q={quote_plus(role)}&l={quote_plus(location)}&start={pg * 10}"
-            )
-            for attempt in range(MAX_RETRIES):
-                try:
-                    delay(1, 2.5)
-                    resp = c.get(rss_url, headers={
-                        **hdr(), "Accept": "application/rss+xml, application/xml, text/xml, */*",
-                    })
-                    if resp.status_code in (403, 429):
-                        logger.warning(f"Indeed RSS page {pg}: {resp.status_code}")
-                        backoff(attempt, base=10)
-                        continue
-                    resp.raise_for_status()
-                    break
-                except httpx.HTTPError as e:
-                    logger.error(f"Indeed RSS page {pg}: {e}")
-                    backoff(attempt, base=5)
-            else:
-                break
-
-            batch = _parse_indeed_rss(resp.text, location)
-            if not batch:
-                break
-            jobs.extend(batch)
-            logger.info(f"Indeed RSS page {pg}: {len(batch)} jobs")
-            if len(batch) < 10:
-                break
-
-        if jobs:
-            logger.info(f"Indeed RSS total: {len(jobs)}")
-            return jobs
-
-        # Phase 2: HTML fallback
-        logger.info("Indeed RSS got 0 — trying HTML")
         for pg in range(max_pages):
             url = (
                 f"https://www.indeed.com/jobs"
                 f"?q={quote_plus(role)}&l={quote_plus(location)}&start={pg * 10}"
             )
+            resp = None
             for attempt in range(MAX_RETRIES):
                 try:
                     delay(2, 5)
                     resp = c.get(url, headers=hdr())
                     if resp.status_code in (403, 429):
+                        logger.warning(
+                            f"Indeed page {pg}: {resp.status_code}"
+                        )
                         backoff(attempt, base=15)
                         continue
                     resp.raise_for_status()
                     break
-                except httpx.HTTPError:
+                except httpx.HTTPError as e:
+                    logger.error(f"Indeed page {pg}: {e}")
                     backoff(attempt, base=10)
             else:
                 break
 
-            batch = _parse_indeed_html(BeautifulSoup(resp.text, "html.parser"), location)
+            if not resp or resp.status_code != 200:
+                break
+
+            batch = _parse_indeed_html(
+                BeautifulSoup(resp.text, "html.parser"), location
+            )
             if not batch:
+                logger.info(f"Indeed page {pg}: no cards, stopping")
                 break
             jobs.extend(batch)
-            logger.info(f"Indeed HTML page {pg}: {len(batch)} jobs")
+            logger.info(f"Indeed page {pg}: {len(batch)} jobs")
 
     logger.info(f"Indeed total: {len(jobs)}")
     return jobs
-
 
 def _parse_indeed_rss(xml_text: str, fallback_loc: str) -> list[dict]:
     jobs = []

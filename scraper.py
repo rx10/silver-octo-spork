@@ -1,7 +1,11 @@
 """
-Job scraper for Dice.com and LinkedIn.
+Job scraper for Dice.com, LinkedIn, and Indeed.
 Dice: intercepts API key via headless browser, falls back to env var.
-LinkedIn: scrapes public search pages + fetches detail pages for descriptions.
+LinkedIn: Playwright for search pages, httpx for detail pages.
+Indeed: Playwright with bot detection avoidance.
+
+Proxy support: set PROXY_URL env var for a single proxy, or
+PROXY_LIST_URL for a rotating proxy list endpoint.
 """
 
 import json, re, os, hashlib, random, time, logging
@@ -22,6 +26,107 @@ USER_AGENTS = [
 
 MAX_RETRIES = 3
 _cached_api_key: Optional[str] = None
+
+
+# ── Proxy support ─────────────────────────────────────────────────────────────
+
+_proxy_pool: list[str] = []
+_proxy_pool_fetched = False
+
+def _load_proxies() -> list[str]:
+    """
+    Load proxies from environment or fetch from a public list.
+    Priority:
+      1. PROXY_URL env var       → single proxy (e.g. socks5://user:pass@host:port)
+      2. PROXY_LIST_URL env var  → URL returning one proxy per line
+      3. Free proxy list fetch   → best-effort, most will be dead
+    Returns list of proxy URLs like "http://ip:port" or "socks5://ip:port"
+    """
+    global _proxy_pool, _proxy_pool_fetched
+    if _proxy_pool_fetched:
+        return _proxy_pool
+
+    _proxy_pool_fetched = True
+
+    # 1. Single configured proxy
+    single = os.getenv("PROXY_URL", "").strip()
+    if single:
+        _proxy_pool = [single]
+        logger.info(f"Using configured proxy: {single[:30]}…")
+        return _proxy_pool
+
+    # 2. Custom proxy list URL
+    list_url = os.getenv("PROXY_LIST_URL", "").strip()
+    if list_url:
+        try:
+            resp = httpx.get(list_url, timeout=10)
+            proxies = [line.strip() for line in resp.text.splitlines() if line.strip()]
+            if proxies:
+                _proxy_pool = proxies
+                logger.info(f"Loaded {len(proxies)} proxies from PROXY_LIST_URL")
+                return _proxy_pool
+        except Exception as e:
+            logger.warning(f"Failed to fetch proxy list: {e}")
+
+    # 3. Free proxy list (best-effort — Webshare free API or proxyscrape)
+    free_sources = [
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=US&ssl=all&anonymity=all",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    ]
+    for src in free_sources:
+        try:
+            resp = httpx.get(src, timeout=10)
+            lines = [line.strip() for line in resp.text.splitlines() if re.match(r'\d+\.\d+\.\d+\.\d+:\d+', line.strip())]
+            if lines:
+                # Take a random sample — most will be dead
+                sample = random.sample(lines, min(20, len(lines)))
+                _proxy_pool = [f"http://{p}" for p in sample]
+                logger.info(f"Loaded {len(_proxy_pool)} free proxies from {src[:50]}…")
+                return _proxy_pool
+        except Exception:
+            continue
+
+    logger.info("No proxies available — running direct")
+    return _proxy_pool
+
+
+def get_proxy() -> Optional[str]:
+    """Return a random proxy URL, or None if no proxies available."""
+    proxies = _load_proxies()
+    return random.choice(proxies) if proxies else None
+
+
+def get_httpx_proxy_arg() -> Optional[str]:
+    """Return proxy string for httpx.Client(proxy=...)"""
+    return get_proxy()
+
+
+def get_pw_proxy_arg() -> Optional[dict]:
+    """
+    Return proxy dict for Playwright browser.new_context(proxy=...).
+    Format: {"server": "http://ip:port"} or {"server": "...", "username": "...", "password": "..."}
+    """
+    proxy = get_proxy()
+    if not proxy:
+        return None
+
+    # Parse auth from URL like http://user:pass@host:port
+    from urllib.parse import urlparse
+    parsed = urlparse(proxy)
+    result = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+    if parsed.username:
+        result["username"] = parsed.username
+    if parsed.password:
+        result["password"] = parsed.password
+    return result
+
+
+def _make_httpx_client(**kwargs) -> httpx.Client:
+    """Create an httpx Client with proxy support if available."""
+    proxy = get_httpx_proxy_arg()
+    if proxy:
+        kwargs.setdefault("proxy", proxy)
+    return httpx.Client(**kwargs)
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -180,7 +285,7 @@ def scrape_dice(role: str, location: str, max_pages=3) -> list[dict]:
     if dice_location != location:
         logger.info(f"Dice: non-US location '{location}' → searching '{dice_location}' instead")
 
-    with httpx.Client(timeout=15, follow_redirects=True) as client:
+    with _make_httpx_client(timeout=15, follow_redirects=True) as client:
         for page in range(1, max_pages + 1):
             url = (f"https://job-search-api.svc.dhigroupinc.com/v1/dice/jobs/search"
                    f"?q={quote_plus(role)}&location={quote_plus(dice_location)}"
@@ -311,11 +416,16 @@ def scrape_linkedin(role: str, location: str, max_pages=3, max_details=15) -> li
         try:
             with sync_playwright() as pw:
                 browser = pw.chromium.launch(headless=True)
-                context = browser.new_context(
-                    user_agent=random.choice(USER_AGENTS),
-                    viewport={"width": 1366, "height": 768},
-                    locale="en-US",
-                )
+                ctx_args = {
+                    "user_agent": random.choice(USER_AGENTS),
+                    "viewport": {"width": 1366, "height": 768},
+                    "locale": "en-US",
+                }
+                pw_proxy = get_pw_proxy_arg()
+                if pw_proxy:
+                    ctx_args["proxy"] = pw_proxy
+                    logger.info(f"LinkedIn Playwright: using proxy {pw_proxy['server']}")
+                context = browser.new_context(**ctx_args)
                 page = context.new_page()
 
                 for pg_num in range(max_pages):
@@ -395,7 +505,7 @@ def scrape_linkedin(role: str, location: str, max_pages=3, max_details=15) -> li
     # ── Fallback: httpx search if Playwright got nothing ──────────────────────
     if not jobs:
         logger.info("LinkedIn: Playwright got 0 results, trying httpx fallback")
-        with httpx.Client(timeout=20, follow_redirects=True) as client:
+        with _make_httpx_client(timeout=20, follow_redirects=True) as client:
             for pg_num in range(max_pages):
                 url = (f"https://www.linkedin.com/jobs/search/"
                        f"?keywords={quote_plus(role)}&location={quote_plus(location)}"
@@ -451,7 +561,7 @@ def scrape_linkedin(role: str, location: str, max_pages=3, max_details=15) -> li
         to_fetch = [j for j in jobs if not j.get("description")][:max_details]
         logger.info(f"LinkedIn: fetching details for {len(to_fetch)}/{len(jobs)} jobs")
 
-        with httpx.Client(timeout=20, follow_redirects=True) as client:
+        with _make_httpx_client(timeout=20, follow_redirects=True) as client:
             for job in to_fetch:
                 try:
                     delay(2, 5)
@@ -487,12 +597,17 @@ def scrape_indeed(role: str, location: str, max_pages=3) -> list[dict]:
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent=random.choice(USER_AGENTS),
-                viewport={"width": 1366, "height": 768},
-                locale="en-US",
-                timezone_id="America/New_York",
-            )
+            ctx_args = {
+                "user_agent": random.choice(USER_AGENTS),
+                "viewport": {"width": 1366, "height": 768},
+                "locale": "en-US",
+                "timezone_id": "America/New_York",
+            }
+            pw_proxy = get_pw_proxy_arg()
+            if pw_proxy:
+                ctx_args["proxy"] = pw_proxy
+                logger.info(f"Indeed Playwright: using proxy {pw_proxy['server']}")
+            context = browser.new_context(**ctx_args)
             # Block images/fonts/css to speed up loading
             context.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,css}", lambda route: route.abort())
 

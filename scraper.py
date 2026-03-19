@@ -66,6 +66,24 @@ def parse_date(s: Optional[str]) -> Optional[str]:
         return today.isoformat()
 
 
+# ── Location helpers ──────────────────────────────────────────────────────────
+
+_US_ABBREVS = {
+    "al","ak","az","ar","ca","co","ct","de","fl","ga","hi","id","il","in","ia",
+    "ks","ky","la","me","md","ma","mi","mn","ms","mo","mt","ne","nv","nh","nj",
+    "nm","ny","nc","nd","oh","ok","or","pa","ri","sc","sd","tn","tx","ut","vt",
+    "va","wa","wv","wi","wy","dc",
+}
+_US_KEYWORDS = {"united states", "usa", "us", "remote"}
+
+def _is_us_location(location: str) -> bool:
+    loc = location.strip().lower()
+    if any(kw in loc for kw in _US_KEYWORDS):
+        return True
+    parts = [p.strip().rstrip(".") for p in loc.replace(",", " ").split()]
+    return bool(parts and parts[-1] in _US_ABBREVS)
+
+
 # ── Dice API Key ──────────────────────────────────────────────────────────────
 
 def _intercept_key_browser() -> Optional[str]:
@@ -96,7 +114,6 @@ def _intercept_key_browser() -> Optional[str]:
                        wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(3000)
 
-            # type into search to trigger an API call
             if not key:
                 try:
                     inp = page.locator("input[placeholder*='Search'], input[name*='q']").first
@@ -168,7 +185,7 @@ def scrape_dice(role: str, location: str, max_pages=3) -> list[dict]:
                     logger.error(f"Dice page {page} attempt {attempt+1}: {e}")
                     backoff(attempt)
             else:
-                break  # all retries failed
+                break
 
             hits = data.get("data", [])
             if not hits:
@@ -207,7 +224,6 @@ def _extract_description(soup: BeautifulSoup) -> Optional[str]:
             if len(text) > 50:
                 return truncate(text)
 
-    # JSON-LD fallback
     for script in soup.select('script[type="application/ld+json"]'):
         try:
             ld = json.loads(script.string or "")
@@ -229,7 +245,6 @@ def _extract_salary(soup: BeautifulSoup) -> Optional[str]:
             if "$" in text or any(c.isdigit() for c in text):
                 return text
 
-    # JSON-LD
     for script in soup.select('script[type="application/ld+json"]'):
         try:
             ld = json.loads(script.string or "")
@@ -248,7 +263,6 @@ def _extract_salary(soup: BeautifulSoup) -> Optional[str]:
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
 
-    # regex fallback
     m = re.search(r'\$[\d,]+\s*[-–/]+\s*\$[\d,]+', soup.get_text())
     return m.group(0).strip() if m else None
 
@@ -257,7 +271,6 @@ def scrape_linkedin(role: str, location: str, max_pages=3, max_details=15) -> li
     jobs = []
 
     with httpx.Client(timeout=20, follow_redirects=True) as client:
-        # Phase 1: collect cards from search pages
         for page in range(max_pages):
             url = (f"https://www.linkedin.com/jobs/search/"
                    f"?keywords={quote_plus(role)}&location={quote_plus(location)}&start={page*25}")
@@ -310,7 +323,6 @@ def scrape_linkedin(role: str, location: str, max_pages=3, max_details=15) -> li
 
             logger.info(f"LinkedIn page {page}: {len(cards)} cards")
 
-        # Phase 2: fetch detail pages for description & salary
         to_fetch = [j for j in jobs if not j.get("description")][:max_details]
         logger.info(f"LinkedIn: fetching details for {len(to_fetch)}/{len(jobs)} jobs")
 
@@ -337,12 +349,18 @@ def scrape_linkedin(role: str, location: str, max_pages=3, max_details=15) -> li
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def run_scrape(role="Software Developer", location="Hyderabad") -> list[dict]:
-    """Scrape Dice + LinkedIn, deduplicate by URL."""
-    seen = set()
-    results = []
-    for job in scrape_dice(role, location) + scrape_linkedin(role, location):
-        if job["url"] not in seen:
-            seen.add(job["url"])
-            results.append(job)
+    """Scrape Dice + LinkedIn for given location. For non-US locations, also
+    scrape Remote so those jobs show up alongside local results."""
+    locations = [location]
+    if not _is_us_location(location):
+        locations.append("Remote")
+
+    seen, results = set(), []
+    for loc in locations:
+        for job in scrape_dice(role, loc) + scrape_linkedin(role, loc):
+            if job["url"] not in seen:
+                seen.add(job["url"])
+                results.append(job)
+
     logger.info(f"Total unique: {len(results)}")
     return results

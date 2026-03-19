@@ -1,0 +1,87 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd /root/silver-octo-spork
+
+            # Save current commit for rollback
+            PREV_COMMIT=$(git rev-parse HEAD)
+
+            # Pull latest
+            git fetch origin main
+            git reset --hard origin/main
+
+            # Install deps
+            .venv/bin/pip install -r requirements.txt --quiet
+
+            # Restart service
+            systemctl restart jobboard
+
+            # Health check — wait for startup then test
+            sleep 3
+            if ! curl -sf http://127.0.0.1:8000/ > /dev/null 2>&1; then
+              echo "Health check failed, rolling back to $PREV_COMMIT"
+              git reset --hard "$PREV_COMMIT"
+              .venv/bin/pip install -r requirements.txt --quiet
+              systemctl restart jobboard
+              exit 1
+            fi
+
+            echo "Deployed successfully: $(git rev-parse --short HEAD)"name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd /root/silver-octo-spork
+
+            # Save current commit for rollback
+            PREV_COMMIT=$(git rev-parse HEAD)
+
+            # Pull latest
+            git fetch origin main
+            git reset --hard origin/main
+
+            # Install deps
+            .venv/bin/pip install -r requirements.txt --quiet
+
+            # Restart service
+            systemctl restart jobboard
+
+            # Health check — wait for startup then test
+            sleep 3
+            if ! curl -sf http://127.0.0.1:8000/ > /dev/null 2>&1; then
+              echo "Health check failed, rolling back to $PREV_COMMIT"
+              git reset --hard "$PREV_COMMIT"
+              .venv/bin/pip install -r requirements.txt --quiet
+              systemctl restart jobboard
+              exit 1
+            fi
+
+            echo "Deployed successfully: $(git rev-parse --short HEAD)"

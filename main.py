@@ -70,12 +70,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Job Board API", version="1.0.0", lifespan=lifespan)
 
-# Custom CORS — always sends headers, even on 500/502
+
+ALLOWED_ORIGINS = [
+    "https://golden-octo-spork.vercel.app",
+]
+
 class CORSAlways(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("origin", "")
+        allow_origin = origin if origin in ALLOWED_ORIGINS else ""
+
         if request.method == "OPTIONS":
             return Response(status_code=200, headers={
-                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Origin": allow_origin,
                 "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
                 "Access-Control-Allow-Headers": "*",
                 "Access-Control-Max-Age": "86400",
@@ -84,11 +91,11 @@ class CORSAlways(BaseHTTPMiddleware):
             response = await call_next(request)
         except Exception:
             response = Response(status_code=500, content="Internal Server Error")
-        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Origin"] = allow_origin
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "*"
         return response
-
+        
 app.add_middleware(CORSAlways)
 
 

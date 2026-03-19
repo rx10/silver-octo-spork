@@ -293,78 +293,177 @@ def _extract_salary(soup: BeautifulSoup) -> Optional[str]:
 
 
 def scrape_linkedin(role: str, location: str, max_pages=3, max_details=15) -> list[dict]:
+    """
+    Scrape LinkedIn using Playwright for search pages (bypasses 999 blocks)
+    and httpx for detail pages (lighter weight, less likely to be blocked).
+    Falls back to httpx-only if Playwright is unavailable.
+    """
     jobs = []
 
-    with httpx.Client(timeout=20, follow_redirects=True) as client:
-        # Phase 1: collect cards from search pages
-        for page in range(max_pages):
-            url = (f"https://www.linkedin.com/jobs/search/"
-                   f"?keywords={quote_plus(role)}&location={quote_plus(location)}&start={page*25}")
+    # ── Phase 1: Search pages via Playwright ──────────────────────────────────
+    pw_available = True
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        pw_available = False
 
-            for attempt in range(MAX_RETRIES):
-                try:
-                    delay(2, 4.5)
-                    resp = client.get(url, headers=headers())
-                    if resp.status_code in (429, 999):
-                        backoff(attempt, base=15)
-                        continue
-                    resp.raise_for_status()
+    if pw_available:
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                context = browser.new_context(
+                    user_agent=random.choice(USER_AGENTS),
+                    viewport={"width": 1366, "height": 768},
+                    locale="en-US",
+                )
+                page = context.new_page()
+
+                for pg_num in range(max_pages):
+                    url = (f"https://www.linkedin.com/jobs/search/"
+                           f"?keywords={quote_plus(role)}&location={quote_plus(location)}"
+                           f"&start={pg_num * 25}")
+
+                    try:
+                        logger.info(f"LinkedIn page {pg_num}: loading via Playwright")
+                        resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_timeout(random.randint(2000, 4000))
+
+                        # Check for blocks
+                        if resp and resp.status in (429, 999, 403):
+                            logger.warning(f"LinkedIn page {pg_num}: blocked (HTTP {resp.status}), retrying with scroll...")
+                            page.wait_for_timeout(random.randint(5000, 10000))
+                            resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                            page.wait_for_timeout(random.randint(3000, 5000))
+                            if resp and resp.status in (429, 999, 403):
+                                logger.warning(f"LinkedIn page {pg_num}: still blocked, stopping Playwright")
+                                break
+
+                        # Scroll down to trigger lazy-loaded cards
+                        for _ in range(3):
+                            page.evaluate("window.scrollBy(0, 800)")
+                            page.wait_for_timeout(random.randint(500, 1000))
+
+                        content = page.content()
+                    except Exception as e:
+                        logger.warning(f"LinkedIn page {pg_num} Playwright failed: {e}")
+                        break
+
+                    soup = BeautifulSoup(content, "html.parser")
+                    cards = soup.select("div.base-card")
+                    if not cards:
+                        logger.info(f"LinkedIn page {pg_num}: no cards found, stopping")
+                        break
+
+                    for card in cards:
+                        title_el = card.select_one("h3.base-search-card__title, h3")
+                        link_el  = card.select_one("a.base-card__full-link, a")
+                        if not title_el or not link_el:
+                            continue
+
+                        href = link_el.get("href", "").split("?")[0]
+                        if not href.startswith("http"):
+                            continue
+
+                        company_el = card.select_one("h4.base-search-card__subtitle, h4")
+                        loc_el     = card.select_one("span.job-search-card__location, span.location")
+                        date_el    = card.select_one("time")
+                        salary_el  = card.select_one("span.job-search-card__salary-info")
+
+                        jobs.append({
+                            "id":          make_id(href),
+                            "title":       title_el.get_text(strip=True),
+                            "company":     company_el.get_text(strip=True) if company_el else "Unknown",
+                            "location":    loc_el.get_text(strip=True) if loc_el else location,
+                            "posted_date": (date_el.get("datetime") or parse_date(date_el.get_text())) if date_el else None,
+                            "description": None,
+                            "salary":      salary_el.get_text(strip=True) if salary_el else None,
+                            "url":         href,
+                            "source":      "LinkedIn",
+                        })
+
+                    logger.info(f"LinkedIn page {pg_num}: {len(cards)} cards")
+
+                    # Delay between pages
+                    if pg_num < max_pages - 1:
+                        page.wait_for_timeout(random.randint(3000, 6000))
+
+                browser.close()
+
+        except Exception as e:
+            logger.warning(f"LinkedIn Playwright failed entirely: {e}")
+
+    # ── Fallback: httpx search if Playwright got nothing ──────────────────────
+    if not jobs:
+        logger.info("LinkedIn: Playwright got 0 results, trying httpx fallback")
+        with httpx.Client(timeout=20, follow_redirects=True) as client:
+            for pg_num in range(max_pages):
+                url = (f"https://www.linkedin.com/jobs/search/"
+                       f"?keywords={quote_plus(role)}&location={quote_plus(location)}"
+                       f"&start={pg_num * 25}")
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        delay(2, 4.5)
+                        resp = client.get(url, headers=headers())
+                        if resp.status_code in (429, 999):
+                            backoff(attempt, base=15)
+                            continue
+                        resp.raise_for_status()
+                        break
+                    except httpx.HTTPError:
+                        backoff(attempt, base=10)
+                else:
                     break
-                except httpx.HTTPError:
-                    backoff(attempt, base=10)
-            else:
-                break
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-            cards = soup.select("div.base-card")
-            if not cards:
-                break
+                soup = BeautifulSoup(resp.text, "html.parser")
+                cards = soup.select("div.base-card")
+                if not cards:
+                    break
 
-            for card in cards:
-                title_el = card.select_one("h3.base-search-card__title, h3")
-                link_el  = card.select_one("a.base-card__full-link, a")
-                if not title_el or not link_el:
-                    continue
+                for card in cards:
+                    title_el = card.select_one("h3.base-search-card__title, h3")
+                    link_el  = card.select_one("a.base-card__full-link, a")
+                    if not title_el or not link_el:
+                        continue
+                    href = link_el.get("href", "").split("?")[0]
+                    if not href.startswith("http"):
+                        continue
 
-                href = link_el.get("href", "").split("?")[0]
-                if not href.startswith("http"):
-                    continue
+                    company_el = card.select_one("h4.base-search-card__subtitle, h4")
+                    loc_el     = card.select_one("span.job-search-card__location, span.location")
+                    date_el    = card.select_one("time")
+                    salary_el  = card.select_one("span.job-search-card__salary-info")
 
-                company_el = card.select_one("h4.base-search-card__subtitle, h4")
-                loc_el     = card.select_one("span.job-search-card__location, span.location")
-                date_el    = card.select_one("time")
-                salary_el  = card.select_one("span.job-search-card__salary-info")
+                    jobs.append({
+                        "id":          make_id(href),
+                        "title":       title_el.get_text(strip=True),
+                        "company":     company_el.get_text(strip=True) if company_el else "Unknown",
+                        "location":    loc_el.get_text(strip=True) if loc_el else location,
+                        "posted_date": (date_el.get("datetime") or parse_date(date_el.get_text())) if date_el else None,
+                        "description": None,
+                        "salary":      salary_el.get_text(strip=True) if salary_el else None,
+                        "url":         href,
+                        "source":      "LinkedIn",
+                    })
+                logger.info(f"LinkedIn httpx page {pg_num}: {len(cards)} cards")
 
-                jobs.append({
-                    "id":          make_id(href),
-                    "title":       title_el.get_text(strip=True),
-                    "company":     company_el.get_text(strip=True) if company_el else "Unknown",
-                    "location":    loc_el.get_text(strip=True) if loc_el else location,
-                    "posted_date": (date_el.get("datetime") or parse_date(date_el.get_text())) if date_el else None,
-                    "description": None,
-                    "salary":      salary_el.get_text(strip=True) if salary_el else None,
-                    "url":         href,
-                    "source":      "LinkedIn",
-                })
-
-            logger.info(f"LinkedIn page {page}: {len(cards)} cards")
-
-        # Phase 2: fetch detail pages for description & salary
+    # ── Phase 2: Detail pages via httpx ───────────────────────────────────────
+    if jobs:
         to_fetch = [j for j in jobs if not j.get("description")][:max_details]
         logger.info(f"LinkedIn: fetching details for {len(to_fetch)}/{len(jobs)} jobs")
 
-        for job in to_fetch:
-            try:
-                delay(2, 5)
-                resp = client.get(job["url"], headers=headers())
-                if resp.status_code in (429, 999):
+        with httpx.Client(timeout=20, follow_redirects=True) as client:
+            for job in to_fetch:
+                try:
+                    delay(2, 5)
+                    resp = client.get(job["url"], headers=headers())
+                    if resp.status_code in (429, 999):
+                        continue
+                    resp.raise_for_status()
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    job["description"] = job.get("description") or _extract_description(soup)
+                    job["salary"]      = job.get("salary") or _extract_salary(soup)
+                except httpx.HTTPError:
                     continue
-                resp.raise_for_status()
-                soup = BeautifulSoup(resp.text, "html.parser")
-                job["description"] = job.get("description") or _extract_description(soup)
-                job["salary"]      = job.get("salary") or _extract_salary(soup)
-            except httpx.HTTPError:
-                continue
 
         filled = sum(1 for j in jobs if j.get("description"))
         logger.info(f"LinkedIn: {filled}/{len(jobs)} have descriptions")
@@ -398,6 +497,14 @@ def scrape_indeed(role: str, location: str, max_pages=3) -> list[dict]:
             context.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,css}", lambda route: route.abort())
 
             page = context.new_page()
+
+            # Visit homepage first to get cookies and look like a real user
+            try:
+                logger.info("Indeed: warming up with homepage visit")
+                page.goto("https://www.indeed.com", wait_until="domcontentloaded", timeout=20000)
+                page.wait_for_timeout(random.randint(2000, 3000))
+            except Exception:
+                pass  # non-fatal, continue to search
 
             for pg in range(max_pages):
                 start = pg * 10

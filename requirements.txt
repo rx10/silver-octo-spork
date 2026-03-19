@@ -1,21 +1,25 @@
 # Web framework
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
-
+ 
 # HTTP scraping
 httpx>=0.27.0
 beautifulsoup4>=4.12.0
 lxml>=5.1.0          # faster BS4 parser
-
+ 
 # Database
 psycopg2-binary>=2.9.9   # use psycopg2 (non-binary) in production
-
+ 
 # Cache
 redis>=5.0.0
-
+ 
 # Optional: headless browser for Dice API key interception
 playwright>=1.43.0    # uncomment + run: playwright install chromium
-
+ 
+# Scheduler (used by main.py for background jobs)
+apscheduler>=3.10.0
+ 
 # Utilities
 python-dotenv>=1.0.0     # load .env file
 pydantic>=2.0.0          # FastAPI models
+ 

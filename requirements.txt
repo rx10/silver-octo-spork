@@ -14,7 +14,7 @@ psycopg2-binary>=2.9.9   # use psycopg2 (non-binary) in production
 redis>=5.0.0
 
 # Optional: headless browser for Dice API key interception
-# playwright>=1.43.0    # uncomment + run: playwright install chromium
+playwright>=1.43.0    # uncomment + run: playwright install chromium
 
 # Utilities
 python-dotenv>=1.0.0     # load .env file

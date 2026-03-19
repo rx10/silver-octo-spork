@@ -73,6 +73,7 @@ app = FastAPI(title="Job Board API", version="1.0.0", lifespan=lifespan)
 
 ALLOWED_ORIGINS = [
     "https://golden-octo-spork.vercel.app",
+    "https://golden-octo-spork-production.up.railway.app"
 ]
 
 class CORSAlways(BaseHTTPMiddleware):

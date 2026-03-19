@@ -385,21 +385,82 @@ def scrape_linkedin(role: str, location: str, max_pages: int = 5, max_details: i
 # ── Indeed ────────────────────────────────────────────────────────────────────
 
 def scrape_indeed(role: str, location: str, max_pages: int = 5) -> list[dict]:
+    """
+    Scrape Indeed via RSS feed (primary) — public, no auth, not blocked.
+    Falls back to HTML scraping if RSS returns nothing.
+
+    Indeed's RSS endpoint:
+        https://www.indeed.com/rss?q=<role>&l=<location>&start=<offset>
+    Returns standard RSS/XML with <item> elements, each containing:
+        <title>, <link>, <source>, <pubDate>, <description> (HTML snippet)
+    The location and salary are embedded in the description HTML.
+    """
     jobs: list[dict] = []
-    # Indeed remote filter GUID
-    remote_param = "&remotejob=032b3046-06a3-4876-8dfd-474eb5e7ed11" if location.lower() == "remote" else ""
+    is_remote = location.lower() == "remote"
+    # Indeed remote RSS filter
+    remote_param = "&remotejob=032b3046-06a3-4876-8dfd-474eb5e7ed11" if is_remote else ""
+
+    rss_headers = {
+        **headers(),
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+    }
 
     with httpx.Client(timeout=20, follow_redirects=True) as client:
+
+        # ── Phase 1: RSS (primary — not blocked by Indeed) ────────────────────
         for page in range(max_pages):
-            url = (
-                f"https://www.indeed.com/jobs"
-                f"?q={quote_plus(role)}&l={quote_plus(location)}&start={page * 10}{remote_param}"
+            rss_url = (
+                f"https://www.indeed.com/rss"
+                f"?q={quote_plus(role)}&l={quote_plus(location)}"
+                f"&start={page * 10}{remote_param}"
             )
             for attempt in range(MAX_RETRIES):
                 try:
-                    delay(2, 5)
+                    delay(1, 2.5)
+                    resp = client.get(rss_url, headers=rss_headers)
+                    if resp.status_code in (429, 403):
+                        logger.warning(f"Indeed RSS page {page} blocked ({resp.status_code}), backing off")
+                        backoff(attempt, base=10)
+                        continue
+                    resp.raise_for_status()
+                    break
+                except httpx.HTTPError as e:
+                    logger.error(f"Indeed RSS page {page} attempt {attempt + 1}: {e}")
+                    backoff(attempt, base=5)
+            else:
+                logger.warning("Indeed RSS: all retries failed, stopping")
+                break
+
+            rss_jobs = _parse_indeed_rss(resp.text, location)
+            if not rss_jobs:
+                logger.info(f"Indeed RSS page {page}: no items, stopping")
+                break
+
+            jobs.extend(rss_jobs)
+            logger.info(f"Indeed RSS page {page}: {len(rss_jobs)} jobs")
+
+            # RSS returns exactly 10 items per page; if fewer, we're at the end
+            if len(rss_jobs) < 10:
+                break
+
+        if jobs:
+            logger.info(f"Indeed RSS total: {len(jobs)}")
+            return jobs
+
+        # ── Phase 2: HTML fallback (if RSS returned nothing) ──────────────────
+        logger.info("Indeed RSS returned 0 jobs — trying HTML fallback")
+        for page in range(max_pages):
+            url = (
+                f"https://www.indeed.com/jobs"
+                f"?q={quote_plus(role)}&l={quote_plus(location)}"
+                f"&start={page * 10}{remote_param}"
+            )
+            for attempt in range(MAX_RETRIES):
+                try:
+                    delay(3, 6)
                     resp = client.get(url, headers=headers())
                     if resp.status_code in (429, 403):
+                        logger.warning(f"Indeed HTML page {page} blocked ({resp.status_code})")
                         backoff(attempt, base=20)
                         continue
                     resp.raise_for_status()
@@ -410,118 +471,144 @@ def scrape_indeed(role: str, location: str, max_pages: int = 5) -> list[dict]:
                 break
 
             soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Try extracting embedded JSON job data first
-            mosaic_jobs = _parse_indeed_mosaic(soup, location)
-            if mosaic_jobs:
-                jobs.extend(mosaic_jobs)
-                logger.info(f"Indeed page {page} (mosaic): {len(mosaic_jobs)} jobs")
-                continue
-
-            # Fall back to HTML card parsing
-            cards = soup.select("div.job_seen_beacon, div.jobsearch-SerpJobCard, li.css-5lfssm")
-            if not cards:
-                logger.info(f"Indeed page {page}: no cards found, stopping")
+            html_jobs = _parse_indeed_html(soup, location)
+            if not html_jobs:
+                logger.info(f"Indeed HTML page {page}: no cards, stopping")
                 break
-
-            for card in cards:
-                title_el  = card.select_one("h2.jobTitle a span, h2.jobTitle span[title], h2 a span")
-                link_el   = card.select_one("h2.jobTitle a, a.jcs-JobTitle, h2 a")
-                if not title_el or not link_el:
-                    continue
-
-                href = link_el.get("href", "")
-                if href.startswith("/"):
-                    href = f"https://www.indeed.com{href}"
-                # Keep query string for Indeed (job ID is in ?jk= param)
-                if not href.startswith("http"):
-                    continue
-
-                company_el = card.select_one(
-                    "span[data-testid='company-name'], span.companyName, "
-                    "a[data-testid='company-name']"
-                )
-                loc_el     = card.select_one(
-                    "div[data-testid='text-location'], div.companyLocation, "
-                    "span[data-testid='text-location']"
-                )
-                salary_el  = card.select_one(
-                    "div.salary-snippet-container, div[data-testid='attribute_snippet_testid'], "
-                    "span.estimated-salary"
-                )
-                date_el    = card.select_one("span[data-testid='myJobsStateDate'], span.date")
-                snippet_el = card.select_one("div.job-snippet, ul.jobCardShelfContainer")
-
-                salary_text = salary_el.get_text(strip=True) if salary_el else None
-                # Only keep if it looks like a salary
-                if salary_text and not re.search(r'[\d$£€₹]', salary_text):
-                    salary_text = None
-
-                jobs.append({
-                    "id":          make_id(href),
-                    "title":       title_el.get_text(strip=True),
-                    "company":     company_el.get_text(strip=True) if company_el else "Unknown",
-                    "location":    loc_el.get_text(strip=True) if loc_el else location,
-                    "posted_date": parse_date(date_el.get_text(strip=True)) if date_el else None,
-                    "description": truncate(snippet_el.get_text(separator=" ", strip=True)) if snippet_el else None,
-                    "salary":      salary_text,
-                    "url":         href,
-                    "source":      "Indeed",
-                })
-
-            logger.info(f"Indeed page {page} (HTML): {len(cards)} cards")
+            jobs.extend(html_jobs)
+            logger.info(f"Indeed HTML page {page}: {len(html_jobs)} jobs")
 
     logger.info(f"Indeed total: {len(jobs)}")
     return jobs
 
 
-def _parse_indeed_mosaic(soup: BeautifulSoup, fallback_location: str) -> list[dict]:
-    """Try to pull job data from Indeed's embedded JS mosaic object."""
+def _parse_indeed_rss(xml_text: str, fallback_location: str) -> list[dict]:
+    """
+    Parse Indeed RSS XML. Each <item> looks like:
+        <title>Job Title - Company Name - Location</title>
+        <link>https://www.indeed.com/viewjob?jk=...</link>
+        <pubDate>Mon, 18 Mar 2024 12:00:00 GMT</pubDate>
+        <description><![CDATA[ ... HTML snippet ... ]]></description>
+        <source>Company Name</source>
+    """
     jobs: list[dict] = []
-    for script in soup.select("script"):
-        text = script.string or ""
-        if "mosaic-provider-jobcards" not in text:
-            continue
-        # Extract the JSON blob
-        m = re.search(r'"mosaic-provider-jobcards"\s*:\s*(\{.*?"jobs"\s*:\s*\[.*?\].*?\})', text, re.DOTALL)
-        if not m:
-            continue
-        try:
-            blob = json.loads(m.group(1))
-            raw_jobs = blob.get("metaData", {}).get("mosaicProviderJobCardsModel", {}).get("results", [])
-            if not raw_jobs:
-                raw_jobs = blob.get("jobs", [])
-            for item in raw_jobs:
-                job_key = item.get("jobkey", "")
-                job_url = f"https://www.indeed.com/viewjob?jk={job_key}" if job_key else ""
-                if not job_url:
-                    continue
-                salary_info = item.get("extractedSalary") or {}
-                salary = None
-                if salary_info:
-                    lo = salary_info.get("min")
-                    hi = salary_info.get("max")
-                    typ = salary_info.get("type", "year")
-                    if lo and hi:
-                        salary = f"${lo:,.0f}–${hi:,.0f}/{typ}"
-                    elif lo:
-                        salary = f"${lo:,.0f}/{typ}"
+    try:
+        soup = BeautifulSoup(xml_text, "xml")   # lxml xml parser
+    except Exception:
+        soup = BeautifulSoup(xml_text, "html.parser")
 
-                jobs.append({
-                    "id":          make_id(job_url),
-                    "title":       item.get("title", ""),
-                    "company":     item.get("company", "Unknown"),
-                    "location":    item.get("formattedLocation") or fallback_location,
-                    "posted_date": parse_date(item.get("pubDate") or item.get("formattedRelativeTime")),
-                    "description": truncate(
-                        BeautifulSoup(item.get("snippet", ""), "html.parser").get_text(separator=" ", strip=True)
-                    ),
-                    "salary":      salary,
-                    "url":         job_url,
-                    "source":      "Indeed",
-                })
-        except (json.JSONDecodeError, TypeError, ValueError, KeyError):
+    items = soup.find_all("item")
+    if not items:
+        # Try case-insensitive fallback
+        items = soup.select("item")
+
+    for item in items:
+        # ── URL ───────────────────────────────────────────────────────────────
+        link_el = item.find("link")
+        # In RSS, <link> text is sometimes in a sibling text node
+        href = ""
+        if link_el:
+            href = link_el.get_text(strip=True) or link_el.get("href", "")
+        if not href or not href.startswith("http"):
+            # guid often has the real URL
+            guid_el = item.find("guid")
+            href = guid_el.get_text(strip=True) if guid_el else ""
+        if not href.startswith("http"):
             continue
+
+        # ── Title / company / location ────────────────────────────────────────
+        raw_title = item.find("title")
+        raw_title = raw_title.get_text(strip=True) if raw_title else ""
+
+        # Indeed RSS title format: "Job Title - Company - City, State"
+        # Split on " - " (en dash or hyphen)
+        parts = re.split(r"\s+[-–]\s+", raw_title)
+        title   = parts[0].strip() if parts else raw_title
+        company = parts[1].strip() if len(parts) > 1 else "Unknown"
+        loc_raw = parts[2].strip() if len(parts) > 2 else fallback_location
+
+        # <source> tag sometimes has company name
+        source_el = item.find("source")
+        if source_el and source_el.get_text(strip=True):
+            company = source_el.get_text(strip=True)
+
+        # ── Date ──────────────────────────────────────────────────────────────
+        pub_el = item.find("pubDate")
+        posted = parse_date(pub_el.get_text(strip=True)) if pub_el else None
+
+        # ── Description (HTML snippet inside CDATA) ───────────────────────────
+        desc_el = item.find("description")
+        desc_html = desc_el.get_text(strip=True) if desc_el else ""
+        desc_text = BeautifulSoup(desc_html, "html.parser").get_text(separator=" ", strip=True)
+
+        # Extract salary from description if present
+        salary = None
+        sal_match = re.search(
+            r'([$£€₹]\s*[\d,]+(?:\s*[-–]\s*[$£€₹]?\s*[\d,]+)?(?:\s*/\s*(?:yr|year|hr|hour|mo|month))?)',
+            desc_text, re.IGNORECASE
+        )
+        if sal_match:
+            salary = sal_match.group(1).strip()
+
+        # Extract location from description if it's more specific than fallback
+        loc_in_desc = re.search(r'location:\s*([^\n<]+)', desc_text, re.IGNORECASE)
+        if loc_in_desc:
+            loc_raw = loc_in_desc.group(1).strip()
+
+        jobs.append({
+            "id":          make_id(href),
+            "title":       title,
+            "company":     company,
+            "location":    loc_raw or fallback_location,
+            "posted_date": posted,
+            "description": truncate(desc_text),
+            "salary":      salary,
+            "url":         href,
+            "source":      "Indeed",
+        })
+
+    return jobs
+
+
+def _parse_indeed_html(soup: BeautifulSoup, fallback_location: str) -> list[dict]:
+    """HTML card fallback for Indeed — used only when RSS is unavailable."""
+    jobs: list[dict] = []
+    cards = soup.select("div.job_seen_beacon, div.jobsearch-SerpJobCard, li.css-5lfssm")
+
+    for card in cards:
+        title_el  = card.select_one("h2.jobTitle a span, h2.jobTitle span[title], h2 a span")
+        link_el   = card.select_one("h2.jobTitle a, a.jcs-JobTitle, h2 a")
+        if not title_el or not link_el:
+            continue
+
+        href = link_el.get("href", "")
+        if href.startswith("/"):
+            href = f"https://www.indeed.com{href}"
+        if not href.startswith("http"):
+            continue
+
+        company_el = card.select_one("span[data-testid='company-name'], span.companyName")
+        loc_el     = card.select_one("div[data-testid='text-location'], div.companyLocation")
+        salary_el  = card.select_one("div.salary-snippet-container, span.estimated-salary")
+        date_el    = card.select_one("span[data-testid='myJobsStateDate'], span.date")
+        snippet_el = card.select_one("div.job-snippet, ul.jobCardShelfContainer")
+
+        salary_text = salary_el.get_text(strip=True) if salary_el else None
+        if salary_text and not re.search(r'[\d$£€₹]', salary_text):
+            salary_text = None
+
+        jobs.append({
+            "id":          make_id(href),
+            "title":       title_el.get_text(strip=True),
+            "company":     company_el.get_text(strip=True) if company_el else "Unknown",
+            "location":    loc_el.get_text(strip=True) if loc_el else fallback_location,
+            "posted_date": parse_date(date_el.get_text(strip=True)) if date_el else None,
+            "description": truncate(snippet_el.get_text(separator=" ", strip=True)) if snippet_el else None,
+            "salary":      salary_text,
+            "url":         href,
+            "source":      "Indeed",
+        })
+
     return jobs
 
 

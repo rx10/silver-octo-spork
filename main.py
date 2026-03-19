@@ -95,18 +95,17 @@ app.add_middleware(CORSAlways)
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def refresh_jobs(db: Session, raw_jobs: list[dict]) -> int:
-    """Clear all existing jobs and insert the fresh batch."""
-    deleted = db.query(Job).delete()
-    logger.info(f"Cleared {deleted} old jobs from database")
-
+    from sqlalchemy.dialects.postgresql import insert
     now = datetime.utcnow()
     for data in raw_jobs:
-        db.add(Job(**data, scraped_at=now))
-
+        stmt = insert(Job).values(**data, scraped_at=now)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["id"],
+            set_={c: stmt.excluded[c] for c in data if c != "id"}
+        )
+        db.execute(stmt)
     db.commit()
-    logger.info(f"Inserted {len(raw_jobs)} fresh jobs")
     return len(raw_jobs)
-
 
 def _do_scrape(role: str, location: str):
     """Run the scrape synchronously and persist results."""

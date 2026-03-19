@@ -591,50 +591,139 @@ def _scrape_linkedin_httpx_fallback(role, location, max_pages, max_details):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def scrape_indeed(role: str, location: str, max_pages=5) -> list[dict]:
-    """HTML scrape with proxy. RSS endpoint is defunct (404)."""
+    """curl_cffi with Chrome TLS + proxy for Indeed HTML scrape."""
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError:
+        logger.error("curl_cffi not installed — Indeed will likely fail")
+        return _scrape_indeed_httpx_fallback(role, location, max_pages)
+
+    jobs = []
+    session_id = _new_session_id()
+    proxy = _proxy_url(sticky_session=session_id)
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    session = curl_requests.Session(
+        impersonate="chrome124", proxies=proxies
+    )
+
+    # Warm up — visit Indeed homepage for cookies
+    try:
+        logger.info("Indeed: warming up session")
+        session.get("https://www.indeed.com/", headers=hdr(), timeout=15)
+        delay(2, 4)
+    except Exception as e:
+        logger.warning(f"Indeed warmup failed: {e}")
+
+    for pg in range(max_pages):
+        url = (
+            f"https://www.indeed.com/jobs"
+            f"?q={quote_plus(role)}&l={quote_plus(location)}"
+            f"&start={pg * 10}"
+        )
+
+        success = False
+        for attempt in range(MAX_RETRIES):
+            try:
+                delay(2, 5)
+                resp = session.get(url, headers=hdr(), timeout=30)
+
+                if resp.status_code in (403, 429):
+                    logger.warning(
+                        f"Indeed page {pg}: {resp.status_code} "
+                        f"(attempt {attempt + 1})"
+                    )
+                    # Rotate session
+                    session_id = _new_session_id()
+                    proxy = _proxy_url(sticky_session=session_id)
+                    proxies = (
+                        {"http": proxy, "https": proxy} if proxy else None
+                    )
+                    session = curl_requests.Session(
+                        impersonate="chrome124", proxies=proxies
+                    )
+                    try:
+                        session.get(
+                            "https://www.indeed.com/",
+                            headers=hdr(),
+                            timeout=15,
+                        )
+                        delay(3, 5)
+                    except Exception:
+                        pass
+                    backoff(attempt, base=10)
+                    continue
+
+                if resp.status_code == 200:
+                    success = True
+                    break
+
+                logger.warning(
+                    f"Indeed page {pg}: unexpected {resp.status_code}"
+                )
+                backoff(attempt)
+
+            except Exception as e:
+                logger.error(f"Indeed page {pg} error: {e}")
+                backoff(attempt)
+
+        if not success:
+            break
+
+        batch = _parse_indeed_html(
+            BeautifulSoup(resp.text, "html.parser"), location
+        )
+        if not batch:
+            logger.info(f"Indeed page {pg}: no cards, stopping")
+            break
+        jobs.extend(batch)
+        logger.info(f"Indeed page {pg}: {len(batch)} jobs")
+
+    logger.info(f"Indeed total: {len(jobs)}")
+    return jobs
+
+
+def _scrape_indeed_httpx_fallback(
+    role: str, location: str, max_pages: int
+) -> list[dict]:
+    """Fallback if curl_cffi unavailable."""
     jobs = []
     session_id = _new_session_id()
 
-    with _httpx_client(sticky=session_id, timeout=20, follow_redirects=True) as c:
+    with _httpx_client(
+        sticky=session_id, timeout=20, follow_redirects=True
+    ) as c:
         for pg in range(max_pages):
             url = (
                 f"https://www.indeed.com/jobs"
-                f"?q={quote_plus(role)}&l={quote_plus(location)}&start={pg * 10}"
+                f"?q={quote_plus(role)}&l={quote_plus(location)}"
+                f"&start={pg * 10}"
             )
-            resp = None
             for attempt in range(MAX_RETRIES):
                 try:
                     delay(2, 5)
                     resp = c.get(url, headers=hdr())
                     if resp.status_code in (403, 429):
-                        logger.warning(
-                            f"Indeed page {pg}: {resp.status_code}"
-                        )
                         backoff(attempt, base=15)
                         continue
                     resp.raise_for_status()
                     break
-                except httpx.HTTPError as e:
-                    logger.error(f"Indeed page {pg}: {e}")
+                except httpx.HTTPError:
                     backoff(attempt, base=10)
             else:
-                break
-
-            if not resp or resp.status_code != 200:
                 break
 
             batch = _parse_indeed_html(
                 BeautifulSoup(resp.text, "html.parser"), location
             )
             if not batch:
-                logger.info(f"Indeed page {pg}: no cards, stopping")
                 break
             jobs.extend(batch)
-            logger.info(f"Indeed page {pg}: {len(batch)} jobs")
+            logger.info(f"Indeed httpx page {pg}: {len(batch)} jobs")
 
-    logger.info(f"Indeed total: {len(jobs)}")
+    logger.info(f"Indeed httpx total: {len(jobs)}")
     return jobs
 
+    
 def _parse_indeed_rss(xml_text: str, fallback_loc: str) -> list[dict]:
     jobs = []
     try:

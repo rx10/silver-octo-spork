@@ -615,21 +615,83 @@ def _parse_indeed_html(soup: BeautifulSoup, fallback_location: str) -> list[dict
 # ── ZipRecruiter ──────────────────────────────────────────────────────────────
 
 def scrape_ziprecruiter(role: str, location: str, max_pages: int = 5) -> list[dict]:
+    """
+    Scrape ZipRecruiter via RSS feed (primary) — public, not blocked.
+    Falls back to their job-search JSON API (no auth needed for basic queries).
+
+    RSS endpoint:
+        https://www.ziprecruiter.com/jobs/search?q=<role>&l=<location>&format=rss
+    JSON API endpoint (unofficial but stable):
+        https://www.ziprecruiter.com/jobs-search?search=<role>&location=<location>
+        &form=jobs-landing&is_remote_job=<0|1>&page=<n>  → returns JSON
+    """
     jobs: list[dict] = []
-    remote_flag = "&remote=1" if location.lower() == "remote" else ""
+    is_remote  = location.lower() == "remote"
+    remote_rss = "&remote=1" if is_remote else ""
+
+    rss_headers = {
+        **headers(),
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+    }
 
     with httpx.Client(timeout=20, follow_redirects=True) as client:
+
+        # ── Phase 1: RSS (primary) ─────────────────────────────────────────────
         for page in range(1, max_pages + 1):
-            url = (
-                f"https://www.ziprecruiter.com/candidate/search"
-                f"?search={quote_plus(role)}&location={quote_plus(location)}&page={page}{remote_flag}"
+            rss_url = (
+                f"https://www.ziprecruiter.com/jobs/search"
+                f"?q={quote_plus(role)}&l={quote_plus(location)}"
+                f"&format=rss&page={page}{remote_rss}"
             )
             for attempt in range(MAX_RETRIES):
                 try:
-                    delay(2, 5)
-                    resp = client.get(url, headers=headers())
-                    if resp.status_code in (429, 403):
-                        backoff(attempt, base=20)
+                    delay(1, 2.5)
+                    resp = client.get(rss_url, headers=rss_headers)
+                    if resp.status_code in (403, 429):
+                        logger.warning(f"ZipRecruiter RSS page {page} blocked ({resp.status_code})")
+                        backoff(attempt, base=10)
+                        continue
+                    resp.raise_for_status()
+                    break
+                except httpx.HTTPError as e:
+                    logger.error(f"ZipRecruiter RSS page {page} attempt {attempt + 1}: {e}")
+                    backoff(attempt, base=5)
+            else:
+                break
+
+            rss_jobs = _parse_ziprecruiter_rss(resp.text, location)
+            if not rss_jobs:
+                logger.info(f"ZipRecruiter RSS page {page}: no items, stopping")
+                break
+
+            jobs.extend(rss_jobs)
+            logger.info(f"ZipRecruiter RSS page {page}: {len(rss_jobs)} jobs")
+
+            if len(rss_jobs) < 10:
+                break  # last page
+
+        if jobs:
+            logger.info(f"ZipRecruiter RSS total: {len(jobs)}")
+            return jobs
+
+        # ── Phase 2: JSON API fallback ─────────────────────────────────────────
+        logger.info("ZipRecruiter RSS returned 0 — trying JSON API fallback")
+        for page in range(1, max_pages + 1):
+            api_url = (
+                f"https://www.ziprecruiter.com/jobs-search"
+                f"?search={quote_plus(role)}&location={quote_plus(location)}"
+                f"&form=jobs-landing&is_remote_job={'1' if is_remote else '0'}"
+                f"&page={page}"
+            )
+            for attempt in range(MAX_RETRIES):
+                try:
+                    delay(2, 4)
+                    resp = client.get(
+                        api_url,
+                        headers={**headers(), "Accept": "application/json, text/javascript, */*"},
+                    )
+                    if resp.status_code in (403, 429):
+                        backoff(attempt, base=15)
                         continue
                     resp.raise_for_status()
                     break
@@ -638,106 +700,168 @@ def scrape_ziprecruiter(role: str, location: str, max_pages: int = 5) -> list[di
             else:
                 break
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Try JSON-in-page extraction first
-            json_jobs = _parse_ziprecruiter_json(soup, location)
-            if json_jobs:
-                jobs.extend(json_jobs)
-                logger.info(f"ZipRecruiter page {page} (JSON): {len(json_jobs)} jobs")
-                continue
-
-            # HTML fallback
-            cards = soup.select(
-                "article.job_result, div[class*='jobList_item'], "
-                "li[class*='job-listing'], div[data-testid='job-card']"
-            )
-            if not cards:
-                logger.info(f"ZipRecruiter page {page}: no cards, stopping")
+            api_jobs = _parse_ziprecruiter_json_api(resp.text, location)
+            if not api_jobs:
+                logger.info(f"ZipRecruiter JSON API page {page}: no jobs, stopping")
                 break
-
-            for card in cards:
-                title_el   = card.select_one("h2 a, h3 a, a[class*='job_link'], a[data-testid='job-title']")
-                company_el = card.select_one(
-                    "a[class*='company'], span[class*='company'], p[class*='company']"
-                )
-                loc_el     = card.select_one(
-                    "span[class*='location'], p[class*='location'], div[class*='location']"
-                )
-                salary_el  = card.select_one(
-                    "span[class*='salary'], div[class*='salary'], p[class*='compensation']"
-                )
-                snippet_el = card.select_one(
-                    "p[class*='job_description'], div[class*='snippet'], ul[class*='bullets']"
-                )
-
-                if not title_el:
-                    continue
-                href = title_el.get("href", "")
-                if href.startswith("/"):
-                    href = f"https://www.ziprecruiter.com{href}"
-                if not href.startswith("http"):
-                    continue
-
-                jobs.append({
-                    "id":          make_id(href),
-                    "title":       title_el.get_text(strip=True),
-                    "company":     company_el.get_text(strip=True) if company_el else "Unknown",
-                    "location":    loc_el.get_text(strip=True) if loc_el else location,
-                    "posted_date": None,
-                    "description": truncate(snippet_el.get_text(separator=" ", strip=True)) if snippet_el else None,
-                    "salary":      salary_el.get_text(strip=True) if salary_el else None,
-                    "url":         href,
-                    "source":      "ZipRecruiter",
-                })
-
-            logger.info(f"ZipRecruiter page {page} (HTML): {len(cards)} cards")
+            jobs.extend(api_jobs)
+            logger.info(f"ZipRecruiter JSON API page {page}: {len(api_jobs)} jobs")
 
     logger.info(f"ZipRecruiter total: {len(jobs)}")
     return jobs
 
 
-def _parse_ziprecruiter_json(soup: BeautifulSoup, fallback_location: str) -> list[dict]:
-    """Extract jobs from ZipRecruiter's embedded __NEXT_DATA__ or window.__data JSON."""
+def _parse_ziprecruiter_rss(xml_text: str, fallback_location: str) -> list[dict]:
+    """
+    Parse ZipRecruiter RSS. Each <item> contains:
+        <title>Job Title at Company Name</title>
+        <link>https://www.ziprecruiter.com/...</link>
+        <pubDate>...</pubDate>
+        <description><![CDATA[ HTML snippet ]]></description>
+        <location>City, State</location>   ← ZR-specific extension
+        <salary>$X – $Y</salary>           ← ZR-specific extension (sometimes present)
+    """
     jobs: list[dict] = []
-    for script in soup.select("script[id='__NEXT_DATA__'], script[type='application/json']"):
-        try:
-            data = json.loads(script.string or "")
-            # Navigate the nested structure
-            job_list = (
-                data.get("props", {}).get("pageProps", {}).get("jobListings", [])
-                or data.get("props", {}).get("pageProps", {}).get("jobs", [])
-                or data.get("jobListings", [])
-                or data.get("jobs", [])
-            )
-            for item in job_list:
-                href = item.get("job_url") or item.get("url") or ""
-                if not href:
-                    continue
-                salary_min = item.get("salary_min_annual") or item.get("compensation_min")
-                salary_max = item.get("salary_max_annual") or item.get("compensation_max")
-                salary = None
-                if salary_min and salary_max:
-                    salary = f"${salary_min:,.0f}–${salary_max:,.0f}"
-                elif salary_min:
-                    salary = f"${salary_min:,.0f}+"
+    try:
+        soup = BeautifulSoup(xml_text, "xml")
+    except Exception:
+        soup = BeautifulSoup(xml_text, "html.parser")
 
-                jobs.append({
-                    "id":          make_id(href),
-                    "title":       item.get("title") or item.get("name") or "",
-                    "company":     item.get("hiring_company", {}).get("name") or item.get("company") or "Unknown",
-                    "location":    item.get("location") or item.get("city") or fallback_location,
-                    "posted_date": parse_date(item.get("posted_time") or item.get("posted_at")),
-                    "description": truncate(
-                        BeautifulSoup(item.get("snippet") or item.get("description") or "", "html.parser")
-                        .get_text(separator=" ", strip=True)
-                    ),
-                    "salary":      salary,
-                    "url":         href,
-                    "source":      "ZipRecruiter",
-                })
-        except (json.JSONDecodeError, TypeError, AttributeError):
+    items = soup.find_all("item")
+    if not items:
+        items = soup.select("item")
+
+    for item in items:
+        # URL
+        link_el = item.find("link")
+        href = link_el.get_text(strip=True) if link_el else ""
+        if not href or not href.startswith("http"):
+            guid_el = item.find("guid")
+            href = guid_el.get_text(strip=True) if guid_el else ""
+        if not href.startswith("http"):
             continue
+
+        # Title — ZipRecruiter RSS: "Job Title at Company Name"
+        raw_title = ""
+        title_el = item.find("title")
+        if title_el:
+            raw_title = title_el.get_text(strip=True)
+
+        # Split on " at " to separate title and company
+        if " at " in raw_title:
+            idx     = raw_title.rfind(" at ")
+            title   = raw_title[:idx].strip()
+            company = raw_title[idx + 4:].strip()
+        else:
+            title   = raw_title
+            company = "Unknown"
+
+        # ZipRecruiter RSS often includes <location> tag
+        loc_el  = item.find("location") or item.find("job:location")
+        loc     = loc_el.get_text(strip=True) if loc_el else fallback_location
+
+        # Salary — ZR sometimes includes <salary> or it's in description
+        salary_el = item.find("salary") or item.find("job:salary")
+        salary    = salary_el.get_text(strip=True) if salary_el else None
+
+        # Date
+        pub_el = item.find("pubDate")
+        posted = parse_date(pub_el.get_text(strip=True)) if pub_el else None
+
+        # Description
+        desc_el   = item.find("description")
+        desc_html = desc_el.get_text(strip=True) if desc_el else ""
+        desc_text = BeautifulSoup(desc_html, "html.parser").get_text(separator=" ", strip=True)
+
+        # Extract salary from description if not already found
+        if not salary:
+            sal_m = re.search(
+                r'([$£€₹]\s*[\d,]+(?:\s*[-–]\s*[$£€₹]?\s*[\d,]+)?'
+                r'(?:\s*/\s*(?:yr|year|hr|hour|mo|month|annum))?)',
+                desc_text, re.IGNORECASE,
+            )
+            if sal_m:
+                salary = sal_m.group(1).strip()
+
+        jobs.append({
+            "id":          make_id(href),
+            "title":       title,
+            "company":     company,
+            "location":    loc,
+            "posted_date": posted,
+            "description": truncate(desc_text),
+            "salary":      salary,
+            "url":         href,
+            "source":      "ZipRecruiter",
+        })
+
+    return jobs
+
+
+def _parse_ziprecruiter_json_api(response_text: str, fallback_location: str) -> list[dict]:
+    """
+    Parse ZipRecruiter's jobs-search endpoint which returns JSON or HTML with
+    embedded JSON. Handles both cases.
+    """
+    jobs: list[dict] = []
+
+    # Try direct JSON parse first
+    try:
+        data = json.loads(response_text)
+        job_list = (
+            data.get("jobs")
+            or data.get("job_results", {}).get("jobs", [])
+            or []
+        )
+    except (json.JSONDecodeError, AttributeError):
+        # Embedded JSON in HTML — look for window.__data or __NEXT_DATA__
+        job_list = []
+        for pattern in [
+            r'window\.__data\s*=\s*({.*?});',
+            r'<script[^>]+id="__NEXT_DATA__"[^>]*>({.*?})</script>',
+        ]:
+            m = re.search(pattern, response_text, re.DOTALL)
+            if m:
+                try:
+                    blob = json.loads(m.group(1))
+                    job_list = (
+                        blob.get("jobs")
+                        or blob.get("props", {}).get("pageProps", {}).get("jobs", [])
+                        or []
+                    )
+                    if job_list:
+                        break
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+
+    for item in job_list:
+        href = item.get("job_url") or item.get("url") or ""
+        if not href or not href.startswith("http"):
+            continue
+
+        salary_min = item.get("salary_min_annual") or item.get("compensation_min")
+        salary_max = item.get("salary_max_annual") or item.get("compensation_max")
+        salary = None
+        if salary_min and salary_max:
+            salary = f"${float(salary_min):,.0f}–${float(salary_max):,.0f}"
+        elif salary_min:
+            salary = f"${float(salary_min):,.0f}+"
+
+        desc_raw = item.get("snippet") or item.get("description") or ""
+        desc = truncate(BeautifulSoup(desc_raw, "html.parser").get_text(separator=" ", strip=True))
+
+        jobs.append({
+            "id":          make_id(href),
+            "title":       item.get("title") or item.get("name") or "",
+            "company":     (item.get("hiring_company") or {}).get("name") or item.get("company") or "Unknown",
+            "location":    item.get("location") or item.get("city") or fallback_location,
+            "posted_date": parse_date(item.get("posted_time") or item.get("posted_at")),
+            "description": desc,
+            "salary":      salary,
+            "url":         href,
+            "source":      "ZipRecruiter",
+        })
+
     return jobs
 
 

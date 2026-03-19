@@ -72,13 +72,9 @@ def _load_proxy():
 
     logger.warning("No proxy configured — will likely get blocked by LinkedIn/Indeed")
 
+from urllib.parse import quote
 
 def _proxy_url(sticky_session: Optional[str] = None) -> Optional[str]:
-    """
-    Build proxy URL. If sticky_session is provided, append -sessid-XXX
-    to the username so Oxylabs keeps the same IP for the whole session.
-    Format: http://customer-USER-sessid-abc123:PASS@pr.oxylabs.io:7777
-    """
     _load_proxy()
     if not _proxy_user or not _proxy_pass:
         return None
@@ -87,8 +83,11 @@ def _proxy_url(sticky_session: Optional[str] = None) -> Optional[str]:
     if sticky_session:
         user = f"{_proxy_user}-sessid-{sticky_session}"
 
-    return f"http://{user}:{_proxy_pass}@{_proxy_host}:{_proxy_port}"
-
+    # URL-encode both user and password so +, @, etc. don't break the URL
+    return (
+        f"http://{quote(user, safe='')}:{quote(_proxy_pass, safe='')}"
+        f"@{_proxy_host}:{_proxy_port}"
+    )
 
 def _httpx_client(sticky: Optional[str] = None, **kwargs) -> httpx.Client:
     """Create httpx Client with proxy."""

@@ -2,7 +2,7 @@ name: Deploy
 
 on:
   push:
-    branches: [main]
+    branches: [master]
 
 jobs:
   deploy:
@@ -22,7 +22,7 @@ jobs:
             PREV_COMMIT=$(git rev-parse HEAD)
 
             # Pull latest
-            git fetch origin main
+            git fetch origin master
             git reset --hard origin/main
 
             # Install deps
@@ -45,7 +45,7 @@ jobs:
 
 on:
   push:
-    branches: [main]
+    branches: [master]
 
 jobs:
   deploy:
@@ -65,7 +65,7 @@ jobs:
             PREV_COMMIT=$(git rev-parse HEAD)
 
             # Pull latest
-            git fetch origin main
+            git fetch origin master
             git reset --hard origin/main
 
             # Install deps

@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, String, Text, DateTime, Index
+from sqlalchemy import Column, String, Text, DateTime, Index, Boolean
 from database import Base
 
 
@@ -23,3 +23,12 @@ class Job(Base):
         Index("ix_jobs_location", "location"),
         Index("ix_jobs_source",   "source"),
     )
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id         = Column(String(36), primary_key=True)   # UUID
+    email      = Column(String(255), nullable=False, unique=True, index=True)
+    hashed_pw  = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

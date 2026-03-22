@@ -23,8 +23,9 @@ from sqlalchemy.orm import Session
 
 from database import Base, engine, get_db
 from models import Job
-from schemas import JobOut, ScrapeRequest, ScrapeResponse
+from schemas import JobOut, LoginRequest, SignupRequest, ScrapeRequest, ScrapeResponse, TokenResponse
 from scraper import run_scrape
+from auth import authenticate_user, get_current_user, register_user
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -171,7 +172,21 @@ async def scheduled_scrape():
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
-print("Hello, World!")
+
+# ── auth routes ───────────────────────────────────────────────────────────────
+
+@app.post("/api/auth/signup", response_model=TokenResponse)
+def signup(body: SignupRequest, db: Session = Depends(get_db)):
+    """Register a new account. Returns a JWT on success."""
+    token = register_user(body.email, body.password, db)
+    return TokenResponse(access_token=token)
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login(body: LoginRequest, db: Session = Depends(get_db)):
+    """Authenticate an existing account. Returns a JWT on success."""
+    token = authenticate_user(body.email, body.password, db)
+    return TokenResponse(access_token=token)
 
 
 @app.get("/api/jobs", response_model=list[JobOut])

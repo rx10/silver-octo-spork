@@ -19,6 +19,21 @@ class JobOut(BaseModel):
         from_attributes = True
 
 
+class SignupRequest(BaseModel):
+    email:    str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email:    str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type:   str = "bearer"
+
+
 class ScrapeRequest(BaseModel):
     role:     str = "Software Developer"
     location: str = "California"

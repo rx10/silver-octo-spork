@@ -71,6 +71,17 @@ class Resume(Base):
     created_at  = Column(DateTime,     default=datetime.utcnow, nullable=False)
 
 
+class OTPToken(Base):
+    __tablename__ = "otp_tokens"
+
+    id         = Column(String(36), primary_key=True)
+    email      = Column(String(255), nullable=False, index=True)
+    code       = Column(String(6),   nullable=False)
+    expires_at = Column(DateTime,    nullable=False)
+    used       = Column(Boolean,     nullable=False, default=False)
+    created_at = Column(DateTime,    default=datetime.utcnow, nullable=False)
+
+
 class Application(Base):
     __tablename__ = "applications"
 

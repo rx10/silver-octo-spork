@@ -64,6 +64,7 @@ from routes.resumes import router as resumes_router
 from routes.applications import router as applications_router
 from routes.oauth import router as oauth_router
 from routes.billing import router as billing_router
+from routes.otp import router as otp_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -113,6 +114,7 @@ app.include_router(resumes_router)
 app.include_router(applications_router)
 app.include_router(oauth_router)
 app.include_router(billing_router)
+app.include_router(otp_router)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 

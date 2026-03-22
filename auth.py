@@ -3,6 +3,7 @@
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -65,19 +66,30 @@ def get_current_user(
 
 # ── auth operations ───────────────────────────────────────────────────────────
 
-def register_user(email: str, password: str, db: Session) -> str:
-    """Create a new user and return a JWT. Raises 409 if email taken."""
+def register_user(
+    email: str,
+    password: str,
+    db: Session,
+    full_name: Optional[str] = None,
+) -> tuple[str, User]:
+    """Create a new user and return (jwt, user). Raises 409 if email taken."""
     if db.query(User).filter(User.email == email).first():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
-    user = User(id=str(uuid.uuid4()), email=email, hashed_pw=hash_password(password))
+    user = User(
+        id=str(uuid.uuid4()),
+        email=email,
+        hashed_pw=hash_password(password),
+        full_name=full_name,
+    )
     db.add(user)
     db.commit()
-    return create_access_token(user.id)
+    db.refresh(user)
+    return create_access_token(user.id), user
 
 
-def authenticate_user(email: str, password: str, db: Session) -> str:
-    """Verify credentials and return a JWT. Raises 401 on failure."""
+def authenticate_user(email: str, password: str, db: Session) -> tuple[str, User]:
+    """Verify credentials and return (jwt, user). Raises 401 on failure."""
     user = db.query(User).filter(User.email == email).first()
     if not user or not verify_password(password, user.hashed_pw):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-    return create_access_token(user.id)
+    return create_access_token(user.id), user

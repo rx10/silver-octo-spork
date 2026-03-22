@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 # ── Jobs ──────────────────────────────────────────────────────────────────────
@@ -38,6 +38,14 @@ class SignupRequest(BaseModel):
     email:     str
     password:  str
     full_name: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def must_be_socratic(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not v.endswith("@socratic.pro"):
+            raise ValueError("Only @socratic.pro email addresses may register.")
+        return v
 
 
 class LoginRequest(BaseModel):

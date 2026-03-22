@@ -41,7 +41,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -52,12 +52,13 @@ from models import Job
 from schemas import (
     JobOut,
     LoginRequest,
+    SignupRequest,
     ScrapeRequest,
     ScrapeResponse,
     TokenResponse,
     UserOut,
 )
-from auth import authenticate_user, get_current_user
+from auth import authenticate_user, get_current_user, register_user
 from scraper import run_scrape
 from routes.profile import router as profile_router
 from routes.resumes import router as resumes_router
@@ -221,12 +222,10 @@ def health():
 # ── auth routes ───────────────────────────────────────────────────────────────
 
 @app.post("/api/auth/signup", response_model=TokenResponse)
-def signup():
-    """Registration is currently closed (pitch mode)."""
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="Registration is currently closed. We're in early access — stay tuned!",
-    )
+def signup(body: SignupRequest, db: Session = Depends(get_db)):
+    """Register a new @socratic.pro account."""
+    token, user = register_user(body.email, body.password, db, full_name=body.full_name)
+    return TokenResponse(access_token=token, user=UserOut.model_validate(user))
 
 
 @app.post("/api/auth/login", response_model=TokenResponse)

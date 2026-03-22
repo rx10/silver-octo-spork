@@ -1,0 +1,264 @@
+================================================================================
+SOCRATIC.PRO — BACKEND CHANGES SUMMARY
+================================================================================
+
+--------------------------------------------------------------------------------
+CHANGE 1 — JWT AUTH LAYER (auth.py)
+--------------------------------------------------------------------------------
+File: auth.py
+
+- register_user() now accepts optional full_name param
+- register_user() returns (token, User) tuple instead of just token string
+- authenticate_user() returns (token, User) tuple instead of just token string
+- Both functions do db.refresh(user) before returning so the User object is
+  fully populated
+
+--------------------------------------------------------------------------------
+CHANGE 2 — EXTENDED USER MODEL + NEW MODELS (models.py)
+--------------------------------------------------------------------------------
+File: models.py
+
+User table — new columns added:
+  full_name         VARCHAR(200)  nullable
+  subscription_tier VARCHAR(20)   default 'free'
+  auth_provider     VARCHAR(20)   default 'local'
+  updated_at        TIMESTAMP     auto-updated
+
+New table: user_profiles
+  id                   UUID PK
+  user_id              UUID unique FK → users.id
+  professional_summary TEXT
+  education            JSONB  default []
+  work_experience      JSONB  default []
+  skills               JSONB  default []
+  certifications       JSONB  default []
+  projects             JSONB  default []
+  target_roles         JSONB  nullable
+  target_locations     JSONB  nullable
+  salary_min           INTEGER nullable
+  is_auto_apply        BOOLEAN default false
+  updated_at           TIMESTAMP
+
+New table: resumes
+  id          UUID PK
+  user_id     UUID FK → users.id
+  job_id      VARCHAR(64) nullable FK → jobs.id
+  resume_data JSONB  (structured AI-generated content)
+  pdf_url     VARCHAR(1000) nullable
+  ats_score   VARCHAR(10) nullable
+  template_id VARCHAR(50) default 'classic'
+  version     INTEGER default 1
+  status      VARCHAR(20) default 'draft'
+  created_at  TIMESTAMP
+
+New table: applications
+  id           UUID PK
+  user_id      UUID FK → users.id
+  job_id       VARCHAR(64) FK → jobs.id
+  resume_id    UUID nullable FK → resumes.id
+  status       VARCHAR(20) default 'pending'
+  submitted_at TIMESTAMP nullable
+  notes        TEXT nullable
+  created_at   TIMESTAMP
+
+--------------------------------------------------------------------------------
+CHANGE 3 — NEW SCHEMAS (schemas.py)
+--------------------------------------------------------------------------------
+File: schemas.py
+
+New schemas added:
+  UserOut             — id, email, full_name, subscription_tier, created_at
+  TokenResponse       — updated to include user: UserOut alongside access_token
+  SignupRequest       — added optional full_name field
+  ProfileOut          — full user_profiles row
+  ProfileUpdate       — partial update (all fields optional)
+  SkillsUpdate        — { skills: list[str] }
+  ExperienceEntry     — company, title, start_date, end_date, bullets[]
+  EducationEntry      — school, degree, field, grad_year, gpa
+  PreferencesUpdate   — target_roles, target_locations, salary_min, is_auto_apply
+  ResumeCreate        — job_id, resume_data, template_id
+  ResumeUpdate        — resume_data, template_id, status (all optional)
+  ResumeOut           — full resumes row
+  ApplicationCreate   — job_id, resume_id, notes
+  ApplicationStatusUpdate — status
+  ApplicationOut      — full applications row
+
+--------------------------------------------------------------------------------
+CHANGE 4 — PROFILE ROUTES (routes/profile.py) — NEW FILE
+--------------------------------------------------------------------------------
+File: routes/profile.py
+
+Endpoints (all require Bearer token):
+  GET  /api/v1/profile                — get profile (auto-creates if missing)
+  PUT  /api/v1/profile                — replace any subset of profile fields
+  PATCH /api/v1/profile/skills        — replace skills list
+  PATCH /api/v1/profile/experience    — append one work experience entry
+  PATCH /api/v1/profile/education     — append one education entry
+  PUT  /api/v1/profile/preferences    — update job prefs (roles, locations, salary)
+
+--------------------------------------------------------------------------------
+CHANGE 5 — RESUME ROUTES (routes/resumes.py) — NEW FILE
+--------------------------------------------------------------------------------
+File: routes/resumes.py
+
+Endpoints (all require Bearer token):
+  GET    /api/v1/resumes              — list resumes (filterable by status)
+  POST   /api/v1/resumes              — create a resume manually
+  GET    /api/v1/resumes/{id}         — get one resume
+  PUT    /api/v1/resumes/{id}         — edit resume_data / template / status
+  POST   /api/v1/resumes/{id}/regenerate — call Claude AI, rewrite resume content,
+                                           bump version, set status='generated'
+  GET    /api/v1/resumes/{id}/pdf     — stream ATS-friendly PDF download
+  DELETE /api/v1/resumes/{id}         — soft-delete (sets status='archived')
+
+--------------------------------------------------------------------------------
+CHANGE 6 — APPLICATION TRACKING ROUTES (routes/applications.py) — NEW FILE
+--------------------------------------------------------------------------------
+File: routes/applications.py
+
+Endpoints (all require Bearer token):
+  GET   /api/v1/applications                  — list applications
+  POST  /api/v1/applications                  — log a new application
+  GET   /api/v1/applications/stats            — counts grouped by status
+  PATCH /api/v1/applications/{id}/status      — update status
+    valid statuses: pending, submitted, viewed, interview, rejected, offer
+    setting 'submitted' auto-sets submitted_at timestamp
+
+--------------------------------------------------------------------------------
+CHANGE 7 — AI SERVICE (services/ai.py) — NEW FILE
+--------------------------------------------------------------------------------
+File: services/ai.py
+
+- Uses anthropic Python SDK (AsyncAnthropic)
+- Model: claude-sonnet-4-6 for resume generation
+- Temperature: 0.3 (consistent output, natural variation)
+- Builds a structured prompt from user profile + job description
+- Strips markdown fences from response if present
+- Returns parsed JSON dict matching resume_data schema
+- Raises HTTP 502 on Anthropic API errors
+- Raises HTTP 500 if JSON parsing fails
+- Env var required: ANTHROPIC_API_KEY
+
+resume_data JSON schema produced:
+{
+  "professional_summary": "string",
+  "work_experience": [
+    { "company", "title", "start_date", "end_date", "bullets": [] }
+  ],
+  "education": [
+    { "school", "degree", "field", "year" }
+  ],
+  "skills": { "technical": [], "soft": [] },
+  "certifications": []
+}
+
+--------------------------------------------------------------------------------
+CHANGE 8 — PDF SERVICE (services/pdf.py) — NEW FILE
+--------------------------------------------------------------------------------
+File: services/pdf.py
+
+- Uses ReportLab (pure Python, no external binaries)
+- ATS-friendly: single column, Helvetica font, real text layer, no images
+- Sections: Name/Contact, Summary, Work Experience, Education, Skills, Certs
+- Returns raw bytes — streamed directly to user via /api/v1/resumes/{id}/pdf
+
+--------------------------------------------------------------------------------
+CHANGE 9 — OAUTH ROUTES (routes/oauth.py) — NEW FILE
+--------------------------------------------------------------------------------
+File: routes/oauth.py
+
+Google OAuth (token-based — for SPA frontend):
+  POST /api/auth/oauth/google
+    Frontend sends { id_token } from @react-oauth/google
+    Backend verifies with Google tokeninfo endpoint
+    Creates user if new, returns JWT + user
+
+GitHub OAuth (server-side code exchange):
+  GET /api/auth/github
+    Redirects browser to GitHub authorization page
+  GET /api/auth/github/callback?code=...
+    Exchanges code for access token
+    Fetches user email (including private verified emails)
+    Creates user if new
+    Redirects to FRONTEND_URL/dashboard?token=JWT
+
+Env vars:
+  GOOGLE_CLIENT_ID      — from Google Cloud Console
+  GITHUB_CLIENT_ID      — from GitHub OAuth App
+  GITHUB_CLIENT_SECRET  — from GitHub OAuth App
+  FRONTEND_URL          — https://socratic.pro
+
+--------------------------------------------------------------------------------
+CHANGE 10 — BILLING ROUTES (routes/billing.py) — NEW FILE
+--------------------------------------------------------------------------------
+File: routes/billing.py
+
+  GET  /api/billing/status     — returns { subscription_tier, is_pro }
+  POST /api/billing/checkout   — creates Stripe Checkout session, returns { checkout_url }
+  POST /api/billing/portal     — creates Stripe Customer Portal session, returns { portal_url }
+  POST /api/billing/webhook    — receives Stripe events
+    checkout.session.completed          → sets user.subscription_tier = 'pro'
+    customer.subscription.deleted       → sets user.subscription_tier = 'free'
+    customer.subscription.paused        → sets user.subscription_tier = 'free'
+
+Env vars:
+  STRIPE_SECRET_KEY     — sk_live_... or sk_test_...
+  STRIPE_WEBHOOK_SECRET — whsec_... from Stripe dashboard
+  STRIPE_PRO_PRICE_ID   — price_... for Pro monthly plan
+
+--------------------------------------------------------------------------------
+CHANGE 11 — MAIN.PY UPDATES
+--------------------------------------------------------------------------------
+File: main.py
+
+- Included all 5 new routers: profile, resumes, applications, oauth, billing
+- Added PATCH to CORS allowed methods
+- signup endpoint now returns 503 with early access message (pitch mode)
+- login endpoint now returns user object alongside JWT
+
+--------------------------------------------------------------------------------
+CHANGE 12 — REGISTRATION DISABLED (pitch mode)
+--------------------------------------------------------------------------------
+File: main.py
+
+POST /api/auth/signup now returns:
+  HTTP 503 Service Unavailable
+  { "detail": "Registration is currently closed. We're in early access — stay tuned!" }
+
+To re-enable: uncomment the register_user() call in main.py signup route
+and restore SignupRequest + register_user imports.
+
+--------------------------------------------------------------------------------
+CHANGE 13 — BCRYPT FIX (requirements.txt)
+--------------------------------------------------------------------------------
+File: requirements.txt
+
+Added: bcrypt==4.0.1
+Reason: passlib is incompatible with bcrypt 4.x — pinning to 4.0.1 fixes
+the "module 'bcrypt' has no attribute '__about__'" 500 error on signup/login.
+
+New packages added:
+  anthropic>=0.25.0   — Claude API SDK
+  reportlab>=4.0.0    — PDF generation
+  stripe>=8.0.0       — Stripe payments
+
+--------------------------------------------------------------------------------
+SERVER MIGRATION NOTE
+--------------------------------------------------------------------------------
+The users table already existed before these changes. Run this once on the server
+to add the new columns (new tables are created automatically on restart):
+
+  sudo -u postgres psql your_database
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(200);
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_tier VARCHAR(20) NOT NULL DEFAULT 'free';
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(20) NOT NULL DEFAULT 'local';
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP;
+
+Deploy commands:
+  cd /root/silver-octo-spork
+  git pull
+  source .venv/bin/activate
+  pip install -r requirements.txt
+  sudo systemctl restart jobboard
+
+================================================================================

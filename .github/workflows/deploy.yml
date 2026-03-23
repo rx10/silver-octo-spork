@@ -20,6 +20,7 @@ jobs:
 
             PREV_COMMIT=$(git rev-parse HEAD)
 
+            git remote set-url origin https://github.com/socratic-pro/silver-octo-spork.git
             git fetch origin master
             git reset --hard origin/master
 

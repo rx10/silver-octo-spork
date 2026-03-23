@@ -79,7 +79,7 @@ def create_resume(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
         job_id=body.job_id,
-        resume_data=body.resume_data,
+        resume_data=body.resume_data or {},
         template_id=body.template_id,
     )
     db.add(resume)

@@ -122,9 +122,9 @@ class PreferencesUpdate(BaseModel):
 # ── Resumes ───────────────────────────────────────────────────────────────────
 
 class ResumeCreate(BaseModel):
-    job_id:      Optional[str] = None
-    resume_data: dict          = {}
-    template_id: str           = "classic"
+    job_id:      Optional[str]  = None
+    resume_data: Optional[dict] = None
+    template_id: str            = "classic"
 
 
 class ResumeUpdate(BaseModel):

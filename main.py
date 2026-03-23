@@ -137,7 +137,8 @@ class CORSAlways(BaseHTTPMiddleware):
             })
         try:
             response = await call_next(request)
-        except Exception:
+        except Exception as exc:
+            logger.exception("Unhandled error: %s", exc)
             response = Response(status_code=500, content="Internal Server Error")
         response.headers["Access-Control-Allow-Origin"]  = allow_origin
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"

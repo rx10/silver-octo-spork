@@ -37,6 +37,19 @@ Jobs:
 import logging
 import os
 import threading
+
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
+
+SENTRY_DSN = os.getenv("SENTRY_DSN", "")
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        integrations=[FastApiIntegration(), SqlalchemyIntegration()],
+        traces_sample_rate=0.2,   # 20% of requests traced for performance
+        send_default_pii=False,
+    )
 from contextlib import asynccontextmanager
 from datetime import datetime
 

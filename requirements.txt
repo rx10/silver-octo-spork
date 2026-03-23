@@ -38,3 +38,6 @@ stripe>=8.0.0
 # Utilities
 python-dotenv>=1.0.0
 pydantic>=2.0.0
+
+# Monitoring
+sentry-sdk[fastapi]>=2.0.0

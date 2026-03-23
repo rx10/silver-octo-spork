@@ -20,7 +20,7 @@ jobs:
 
             PREV_COMMIT=$(git rev-parse HEAD)
 
-            git remote set-url origin https://github.com/socratic-pro/silver-octo-spork.git
+            git remote set-url origin https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/socratic-pro/silver-octo-spork.git
             git fetch origin master
             git reset --hard origin/master
 
@@ -28,13 +28,20 @@ jobs:
 
             systemctl restart jobboard
 
-            sleep 3
-            if ! curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
-              echo "Health check failed, rolling back to $PREV_COMMIT"
-              git reset --hard "$PREV_COMMIT"
-              .venv/bin/pip install -r requirements.txt --quiet
-              systemctl restart jobboard
-              exit 1
-            fi
+            for i in 1 2 3 4 5; do
+              sleep 3
+              if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
+                echo "Health check passed"
+                break
+              fi
+              echo "Health check attempt $i failed, retrying..."
+              if [ $i -eq 5 ]; then
+                echo "Health check failed after 5 attempts, rolling back to $PREV_COMMIT"
+                git reset --hard "$PREV_COMMIT"
+                .venv/bin/pip install -r requirements.txt --quiet
+                systemctl restart jobboard
+                exit 1
+              fi
+            done
 
             echo "Deployed successfully: $(git rev-parse --short HEAD)"

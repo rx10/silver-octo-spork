@@ -67,7 +67,7 @@ from routes.oauth import router as oauth_router
 from routes.billing import router as billing_router
 from routes.otp import router as otp_router
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 DEFAULT_ROLE     = os.getenv("SCRAPE_ROLE",     "Software Developer")
@@ -106,7 +106,7 @@ async def lifespan(app: FastAPI):
     logger.info("Scheduler shut down")
 
 
-app = FastAPI(title="Socratic.pro API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Socratic.pro API", version="1.0.0", lifespan=lifespan, debug=True)
 
 # ── routers ───────────────────────────────────────────────────────────────────
 
@@ -146,6 +146,32 @@ class CORSAlways(BaseHTTPMiddleware):
         return response
 
 app.add_middleware(CORSAlways)
+
+
+class LoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        body = await request.body()
+        if body:
+            logger.debug("REQUEST  %s %s  body=%s", request.method, request.url.path, body.decode(errors="replace")[:500])
+        response = await call_next(request)
+        if response.status_code >= 400:
+            # Buffer response to log it
+            resp_body = b""
+            async for chunk in response.body_iterator:
+                resp_body += chunk
+            logger.warning("RESPONSE %s %s → %d  body=%s",
+                           request.method, request.url.path,
+                           response.status_code,
+                           resp_body.decode(errors="replace")[:500])
+            return Response(
+                content=resp_body,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type=response.media_type,
+            )
+        return response
+
+app.add_middleware(LoggingMiddleware)
 
 
 # ── scrape helpers ────────────────────────────────────────────────────────────

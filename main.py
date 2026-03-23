@@ -42,14 +42,12 @@ import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 
-SENTRY_DSN = os.getenv("SENTRY_DSN", "")
-if SENTRY_DSN:
-    sentry_sdk.init(
-        dsn=SENTRY_DSN,
-        integrations=[FastApiIntegration(), SqlalchemyIntegration()],
-        traces_sample_rate=0.2,   # 20% of requests traced for performance
-        send_default_pii=False,
-    )
+sentry_sdk.init(
+    dsn="https://6cba7c183067aa69f9ae1d21914a671b@o4511093388607488.ingest.us.sentry.io/4511093389852672",
+    integrations=[FastApiIntegration(), SqlalchemyIntegration()],
+    traces_sample_rate=0.2,
+    enable_logs=True,
+)
 from contextlib import asynccontextmanager
 from datetime import datetime
 

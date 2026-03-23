@@ -1,8 +1,10 @@
 """Resume routes — /api/v1/resumes"""
 
+import logging
 import uuid
 from datetime import datetime
 
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
@@ -13,6 +15,8 @@ from models import Job, Resume, User, UserProfile
 from schemas import ResumeCreate, ResumeOut, ResumeUpdate
 from services.ai import generate_resume
 from services.pdf import generate_pdf
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/resumes", tags=["resumes"])
 
@@ -124,34 +128,48 @@ async def regenerate_resume(
     Call Claude to (re)generate the resume content from the user's profile
     and the linked job description. Bumps version on each call.
     """
-    resume = _get_resume_or_404(resume_id, current_user.id, db)
+    with sentry_sdk.start_transaction(op="resume.generate", name="Regenerate Resume"):
+        sentry_sdk.set_user({"id": current_user.id, "email": current_user.email})
+        sentry_sdk.set_tag("resume_id", resume_id)
 
-    # Fetch profile
-    profile = db.query(UserProfile).filter(UserProfile.user_id == current_user.id).first()
-    profile_dict = _build_profile_dict(current_user, profile)
+        logger.info("Resume regeneration started — user=%s resume=%s", current_user.id, resume_id)
 
-    # Fetch job if linked
-    job_dict = None
-    if resume.job_id:
-        job = db.query(Job).filter(Job.id == resume.job_id).first()
-        if job:
-            job_dict = {
-                "title":       job.title,
-                "company":     job.company,
-                "description": job.description,
-            }
+        resume = _get_resume_or_404(resume_id, current_user.id, db)
 
-    # Call Claude
-    new_data = await generate_resume(profile_dict, job_dict)
+        # Fetch profile
+        profile = db.query(UserProfile).filter(UserProfile.user_id == current_user.id).first()
+        profile_dict = _build_profile_dict(current_user, profile)
+        sentry_sdk.set_tag("has_profile", profile is not None)
 
-    resume.resume_data = new_data
-    resume.version    += 1
-    resume.status      = "generated"
-    resume.pdf_url     = None   # invalidate old PDF
-    resume.ats_score   = None
-    db.commit()
-    db.refresh(resume)
-    return resume
+        # Fetch job if linked
+        job_dict = None
+        if resume.job_id:
+            job = db.query(Job).filter(Job.id == resume.job_id).first()
+            if job:
+                job_dict = {
+                    "title":       job.title,
+                    "company":     job.company,
+                    "description": job.description,
+                }
+        sentry_sdk.set_tag("has_job", job_dict is not None)
+
+        try:
+            new_data = await generate_resume(profile_dict, job_dict)
+        except Exception as exc:
+            logger.exception("Claude generation failed — resume=%s", resume_id)
+            sentry_sdk.capture_exception(exc)
+            raise HTTPException(status_code=502, detail="AI generation failed. Please try again.")
+
+        resume.resume_data = new_data
+        resume.version    += 1
+        resume.status      = "generated"
+        resume.pdf_url     = None
+        resume.ats_score   = None
+        db.commit()
+        db.refresh(resume)
+
+        logger.info("Resume regeneration complete — resume=%s version=%d", resume_id, resume.version)
+        return resume
 
 
 @router.get("/{resume_id}/pdf")

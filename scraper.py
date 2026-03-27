@@ -866,71 +866,42 @@ def _parse_indeed_page(
 
 
 def scrape_indeed(query: str, location: str = "", max_pages: int = 5) -> List[Dict]:
-    """
-    Indeed scraper with country-aware domain routing + Bright Data Unlocker API.
-    Uses adaptive pagination and cross-page deduplication.
-    """
     domain = _get_indeed_domain(location or "")
     country, city = _get_indeed_geo(location or "", domain)
-    logger.info(f"Indeed: domain={domain}, geo=({country}, {city}) for '{location}'")
 
-    q = quote_plus(query)
-    loc_encoded = quote_plus(location or "")
+    # Multiple query variants to get more results without pagination
+    queries = [query]
+    if "developer" in query.lower():
+        queries.extend([f"{query} junior", f"{query} senior", f"{query} full stack"])
+    elif "sde" in query.lower():
+        queries.extend(["software developer", "software engineer", "SDE 1", "SDE 2"])
 
-    all_jobs: List[Dict] = []
-    seen_urls: set = set()
-    page_size = 10  # adjusted after first page if needed
-    consecutive_empty = 0
+    all_jobs = []
+    seen_urls = set()
 
-    for pg in range(max_pages):
-        start = pg * page_size
-        url = f"https://{domain}/jobs?q={q}&l={loc_encoded}&start={start}"
-        logger.info(f"Indeed page {pg}: {url}")
+    for q in queries:
+        url = f"https://{domain}/jobs?q={quote_plus(q)}&l={quote_plus(location)}&start=0"
+        logger.info(f"Indeed query: {url}")
 
-        # Delay between pages — crucial for Unlocker to not get empty responses
-        if pg > 0:
-            wait = random.uniform(4, 8)
-            logger.info(f"Indeed: waiting {wait:.1f}s before page {pg}")
-            time.sleep(wait)
+        if all_jobs:  # delay between queries
+            time.sleep(random.uniform(4, 8))
 
         try:
             html = _unlocker_get_html(url, country=country)
         except Exception as e:
-            logger.warning(f"Indeed page {pg}: Unlocker failed, stopping: {e}")
-            break
+            logger.warning(f"Indeed query '{q}' failed: {e}")
+            continue
 
         soup = BeautifulSoup(html, "html.parser")
         page_jobs = _parse_indeed_page(soup, fallback_location=location, domain=domain)
 
-        # Deduplicate against already-seen URLs across pages
-        new_jobs = []
-        for job in page_jobs:
-            if job["url"] not in seen_urls:
-                seen_urls.add(job["url"])
-                new_jobs.append(job)
+        new = [j for j in page_jobs if j["url"] not in seen_urls]
+        seen_urls.update(j["url"] for j in new)
+        all_jobs.extend(new)
+        logger.info(f"Indeed query '{q}': {len(page_jobs)} parsed, {len(new)} new")
 
-        logger.info(f"Indeed page {pg}: {len(page_jobs)} parsed, {len(new_jobs)} new")
-
-        if not new_jobs:
-            consecutive_empty += 1
-            if consecutive_empty >= 2:
-                logger.info("Indeed: 2 consecutive empty pages, stopping")
-                break
-            continue
-        else:
-            consecutive_empty = 0
-
-        all_jobs.extend(new_jobs)
-
-        # Adaptive page size: if first page returned more than 10 results,
-        # adjust offset so page 2 doesn't re-fetch overlapping jobs
-        if pg == 0 and len(page_jobs) > 10:
-            page_size = len(page_jobs)
-            logger.info(f"Indeed: adjusted page_size to {page_size} based on first page")
-
-    logger.info(f"Indeed total: {len(all_jobs)} unique jobs (domain: {domain})")
+    logger.info(f"Indeed total: {len(all_jobs)} unique jobs")
     return all_jobs
-
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ZIPRECRUITER

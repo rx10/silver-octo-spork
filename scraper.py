@@ -32,9 +32,12 @@ UNLOCKER_ZONE_NAME = os.environ.get("UNLOCKER_ZONE_NAME")
 
 UNLOCKER_ENDPOINT = "https://api.brightdata.com/request"
 
-def _unlocker_get_html(url: str, country: str | None = None) -> str:
+import time
+
+def _unlocker_get_html(url: str, country: str | None = None, retries: int = 2) -> str:
     """
     Fetch a URL via Bright Data Unlocker API and return HTML as text.
+    Retries a few times if Unlocker returns an empty body.
     """
     if not BRIGHTDATA_API_KEY:
         raise RuntimeError("Missing BRIGHTDATA_API_KEY env var")
@@ -49,32 +52,58 @@ def _unlocker_get_html(url: str, country: str | None = None) -> str:
     payload: dict = {
         "zone": UNLOCKER_ZONE_NAME,
         "url": url,
-        "format": "raw",  # raw HTML from target site
+        "format": "raw",
     }
     if country:
         payload["country"] = country.lower()
 
-    resp = requests.post(UNLOCKER_ENDPOINT, json=payload, headers=headers, timeout=120)
+    last_err = None
+    for attempt in range(1, retries + 2):  # e.g. 1 initial + 2 retries
+        try:
+            resp = requests.post(
+                UNLOCKER_ENDPOINT,
+                json=payload,
+                headers=headers,
+                timeout=120,
+            )
 
-    if not resp.ok:
-        logger.error(
-            "Unlocker HTTP error %s for %s: %r",
-            resp.status_code,
-            url,
-            resp.text[:500],
-        )
-        resp.raise_for_status()
+            if not resp.ok:
+                logger.error(
+                    "Unlocker HTTP error %s for %s (attempt %d): %r",
+                    resp.status_code,
+                    url,
+                    attempt,
+                    resp.text[:500],
+                )
+                resp.raise_for_status()
 
-    # For format="raw", body is the HTML itself
-    html = resp.text
-    if not html.strip():
-        logger.error("Unlocker returned empty body for %s", url)
-        raise RuntimeError(f"Unlocker returned empty body for {url}")
+            html = resp.text
+            if not html.strip():
+                raise RuntimeError("Unlocker returned empty body")
 
-    return html
+            return html
 
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                "Unlocker request failed for %s (attempt %d/%d): %s",
+                url,
+                attempt,
+                retries + 1,
+                e,
+            )
+            if attempt <= retries:
+                time.sleep(2)  # small backoff
+            else:
+                break
 
-
+    # After all attempts
+    logger.error(
+    "Unlocker empty body for %s, raw prefix=%r",
+    url,
+    resp.text[:500],
+    )
+    raise RuntimeError(f"Unlocker returned empty body for {url}") from last_err
 
 MAX_RETRIES = 3
 

@@ -11,18 +11,13 @@ Glassdoor:    curl_cffi + proxy → HTML parse
 
 import json, re, os, hashlib, random, string, time, logging
 from datetime import datetime, timedelta
-from typing import Optional, Callable
+from typing import Optional, Callable, List, Dict
 from urllib.parse import quote_plus, quote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
-
-import os
-import base64
-from playwright.sync_api import sync_playwright
-from playwright.sync_api import Playwright
 
 BROWSER_API_USERNAME = os.environ.get("BROWSER_API_USERNAME")
 BROWSER_API_PASSWORD = os.environ.get("BROWSER_API_PASSWORD")
@@ -37,10 +32,12 @@ def _connect_browser_api(pw: Playwright):
     auth = f"{BROWSER_API_USERNAME}:{BROWSER_API_PASSWORD}"
     auth_header = "Basic " + base64.b64encode(auth.encode()).decode()
 
+    logger.info("Connecting to Browser API via wss://brd.superproxy.io:9222")
     browser = pw.chromium.connect_over_cdp(
         endpoint_url="wss://brd.superproxy.io:9222",
         headers={"Authorization": auth_header},
     )
+    logger.info("Connected to Browser API")
     return browser
 
 MAX_RETRIES = 3
@@ -474,84 +471,50 @@ def _make_session(
 #  GENERIC PAGINATED SCRAPER
 # ═══════════════════════════════════════════════════════════════════════
 
-def _paginated_scrape(
-    *,
+def _paginated_scrape_browser(
     warmup_url: str,
-    url_fn: Callable[[int], str],
-    parse_fn: Callable[[BeautifulSoup, str], list[dict]],
+    url_fn,
+    parse_fn,
     location: str,
     max_pages: int,
-    block_codes: tuple = (403, 429),
-    delay_range: tuple = (2, 5),
-    backoff_base: float = 10.0,
-    max_rotations: int = 3,
-    country: Optional[str] = None,
-    city: Optional[str] = None,
-) -> list[dict]:
-    """Shared loop: session → warmup → paginate → parse → rotate on block. Supports Bright Data geo-targeting."""
-    sid = _new_sid()
-    session, _ = _make_session(sid, country=country, city=city)
-    jobs: list[dict] = []
-    rotations_left = max_rotations
+) -> List[Dict]:
+    results: List[Dict] = []
 
-    try:
-        session.get(warmup_url, headers=hdr(), timeout=15)
-        delay(2, 4)
-    except Exception as e:
-        logger.warning(f"Warmup failed for {warmup_url}: {e}")
+    with sync_playwright() as pw:
+        browser = _connect_browser_api(pw)
+        try:
+            page = browser.new_page()
 
-    for pg in range(max_pages):
-        url = url_fn(pg)
-        success = False
-        for attempt in range(MAX_RETRIES):
-            try:
-                delay(*delay_range)
-                resp = session.get(url, headers=hdr(), timeout=30)
-                if resp.status_code in block_codes:
-                    rotations_left -= 1
-                    if rotations_left <= 0:
-                        logger.error(f"Exhausted session rotations at page {pg}")
-                        return jobs
-                    sid = _new_sid()
-                    try:
-                        session.close()
-                    except Exception:
-                        pass
-                    session, _ = _make_session(sid, country=country, city=city)
-                    try:
-                        session.get(warmup_url, headers=hdr(), timeout=15)
-                        delay(2, 4)
-                    except Exception:
-                        pass
-                    backoff(attempt, base=backoff_base)
-                    continue
-                if resp.status_code == 200:
-                    success = True
+            # Warmup
+            logger.info(f"Warmup: {warmup_url}")
+            page.goto(warmup_url, wait_until="networkidle", timeout=120_000)
+
+            for pg in range(max_pages):
+                url = url_fn(pg)
+                logger.info(f"Page {pg}: {url}")
+                page.goto(url, wait_until="networkidle", timeout=120_000)
+                html = page.content()
+                soup = BeautifulSoup(html, "html.parser")
+                page_jobs = parse_fn(soup, fallback_location=location or "")
+                logger.info(f"Page {pg}: parsed {len(page_jobs)} jobs")
+                if not page_jobs:
+                    # Stop if a page yields no jobs
                     break
-                backoff(attempt)
-            except Exception as e:
-                logger.error(f"Page {pg}: {e}")
-                backoff(attempt)
-        if not success:
-            break
+                results.extend(page_jobs)
+        finally:
+            browser.close()
 
-        batch = parse_fn(BeautifulSoup(resp.text, "html.parser"), location)
-        if not batch:
-            logger.info(f"Page {pg}: no results, stopping")
-            break
-        jobs.extend(batch)
-        logger.info(f"Page {pg}: {len(batch)} jobs")
-
-    try:
-        session.close()
-    except Exception:
-        pass
-    return jobs
+    return results
 
 
 from urllib.parse import quote_plus
 
-def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> list[dict]:
+from urllib.parse import quote_plus
+
+def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> List[Dict]:
+    """
+    Indeed scraper with country-aware domain routing + Bright Data Browser API.
+    """
     domain = _get_indeed_domain(location or "")
     country, city = _get_indeed_geo(location or "", domain)
 
@@ -565,7 +528,7 @@ def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> list[di
         start = pg * 10
         return f"{base_url}&start={start}"
 
-    def parse_fn(soup: BeautifulSoup, fallback_location: str) -> list[dict]:
+    def parse_fn(soup: BeautifulSoup, fallback_location: str) -> List[Dict]:
         jobs = []
         seen = set()
 
@@ -653,30 +616,19 @@ def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> list[di
                 "source": "indeed",
             })
 
-        results: list[dict] = []
+        return jobs
 
-        with sync_playwright() as pw:
-            browser = _connect_browser_api(pw)
-            try:
-                page = browser.new_page()
-
-                # Optional: geo-targeting via Browser API (country/city)
-                # You can also configure geo in the Browser API configuration itself.
-                # Example: page.set_extra_http_headers({"x-bd-geo-country": country})
-
-                # Warmup
-                page.goto(warmup_url, wait_until="networkidle", timeout=120_000)
-
-                for pg in range(max_pages):
-                    url = url_fn(pg)
-                    page.goto(url, wait_until="networkidle", timeout=120_000)
-                    html = page.content()
-                    soup = BeautifulSoup(html, "html.parser")
-                    page_jobs = parse_fn(soup, fallback_location=location or "")
-                    if not page_jobs:
-                        break
-                    results.extend(page_jobs)
-            finally:
-                browser.close()
-
-        return results
+    try:
+        jobs = _paginated_scrape_browser(
+            warmup_url=warmup_url,
+            url_fn=url_fn,
+            parse_fn=parse_fn,
+            location=location,
+            max_pages=max_pages,
+        )
+        logger.info(f"Total jobs scraped: {len(jobs)}")
+        return jobs
+    except Exception:
+        logger.exception("scrape_indeed failed")
+        # Always return a list, never None
+        return []

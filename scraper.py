@@ -28,6 +28,8 @@ from bs4 import BeautifulSoup
 BRIGHTDATA_API_KEY = os.environ.get("BRIGHTDATA_API_KEY")
 UNLOCKER_ZONE_NAME = os.environ.get("UNLOCKER_ZONE_NAME")
 
+
+
 UNLOCKER_ENDPOINT = "https://api.brightdata.com/request"
 
 def _unlocker_get_html(url: str, country: str | None = None) -> str:
@@ -47,14 +49,13 @@ def _unlocker_get_html(url: str, country: str | None = None) -> str:
     payload: dict = {
         "zone": UNLOCKER_ZONE_NAME,
         "url": url,
-        "format": "raw",
+        "format": "raw",  # raw HTML from target site
     }
     if country:
         payload["country"] = country.lower()
 
     resp = requests.post(UNLOCKER_ENDPOINT, json=payload, headers=headers, timeout=120)
 
-    # Log non-2xx responses with body
     if not resp.ok:
         logger.error(
             "Unlocker HTTP error %s for %s: %r",
@@ -64,24 +65,16 @@ def _unlocker_get_html(url: str, country: str | None = None) -> str:
         )
         resp.raise_for_status()
 
-    # Try to parse JSON, but log raw text if it fails
-    try:
-        data = resp.json()
-    except Exception as e:
-        logger.error(
-            "Unlocker returned non-JSON for %s: %s; body prefix=%r",
-            url,
-            e,
-            resp.text[:500],
-        )
-        raise
+    # For format="raw", body is the HTML itself
+    html = resp.text
+    if not html.strip():
+        logger.error("Unlocker returned empty body for %s", url)
+        raise RuntimeError(f"Unlocker returned empty body for {url}")
 
-    body = data.get("body")
-    if body is None:
-        logger.error("Unlocker JSON missing 'body' for %s: %r", url, data)
-        raise RuntimeError(f"Unlocker response missing 'body' for {url}")
+    return html
 
-    return body
+
+
 
 MAX_RETRIES = 3
 
@@ -561,10 +554,16 @@ from urllib.parse import quote_plus
 from urllib.parse import quote_plus
 from typing import List, Dict
 
+
+
 def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> List[Dict]:
     """
     Indeed scraper with country-aware domain routing + Bright Data Unlocker API.
     """
+    html = _unlocker_get_html(url, country=country)
+    soup = BeautifulSoup(html, "html.parser")
+    page_jobs = parse_fn(soup, fallback_location=location or "")
+
     domain = _get_indeed_domain(location or "")
     country, city = _get_indeed_geo(location or "", domain)
 

@@ -870,57 +870,29 @@ def scrape_indeed(query: str, location: str = "", max_pages: int = 5) -> List[Di
     country, city = _get_indeed_geo(location or "", domain)
     logger.info(f"Indeed: domain={domain}, geo=({country}, {city}) for '{location}'")
 
-    # Unlocker can't paginate (no cookie persistence), so use multiple
-    # query variants to maximize coverage from single-page fetches
-    base = query.strip()
-    queries = [base]
+    jobs = _paginated_scrape(
+        warmup_url=f"https://{domain}/",
+        url_fn=lambda pg: (
+            f"https://{domain}/jobs"
+            f"?q={quote_plus(query)}&l={quote_plus(location)}&start={pg * 10}"
+        ),
+        parse_fn=lambda soup, loc: _parse_indeed_page(soup, loc, domain),
+        location=location,
+        max_pages=max_pages,
+        delay_range=(4, 8),
+        country=country,
+        city=city,
+    )
 
-    base_lower = base.lower()
-    if any(kw in base_lower for kw in ("developer", "engineer", "sde")):
-        extras = [
-            "software developer", "software engineer",
-            "full stack developer", "backend developer",
-            "frontend developer", "junior software developer",
-            "senior software developer", "SDE", "SDE 1", "SDE 2",
-            "python developer", "java developer",
-        ]
-        for e in extras:
-            if e.lower() != base_lower:
-                queries.append(e)
+    seen = set()
+    unique = []
+    for j in jobs:
+        if j["url"] not in seen:
+            seen.add(j["url"])
+            unique.append(j)
 
-    all_jobs: List[Dict] = []
-    seen_urls: set = set()
-
-    for i, q in enumerate(queries):
-        url = f"https://{domain}/jobs?q={quote_plus(q)}&l={quote_plus(location)}&start=0"
-        logger.info(f"Indeed [{i+1}/{len(queries)}]: {q}")
-
-        if i > 0:
-            wait = random.uniform(5, 10)
-            logger.info(f"Indeed: waiting {wait:.1f}s")
-            time.sleep(wait)
-
-        try:
-            html = _unlocker_get_html(url, country=country)
-        except Exception as e:
-            logger.warning(f"Indeed query '{q}' failed: {e}")
-            continue
-
-        soup = BeautifulSoup(html, "html.parser")
-        page_jobs = _parse_indeed_page(soup, fallback_location=location, domain=domain)
-
-        new = [j for j in page_jobs if j["url"] not in seen_urls]
-        seen_urls.update(j["url"] for j in new)
-        all_jobs.extend(new)
-        logger.info(f"Indeed '{q}': {len(page_jobs)} parsed, {len(new)} new (total: {len(all_jobs)})")
-
-        # Stop early if we have enough
-        if len(all_jobs) >= 80:
-            logger.info("Indeed: reached 80+ jobs, stopping")
-            break
-
-    logger.info(f"Indeed total: {len(all_jobs)} unique jobs (domain: {domain})")
-    return all_jobs
+    logger.info(f"Indeed total: {len(unique)} unique jobs (domain: {domain})")
+    return unique
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ZIPRECRUITER

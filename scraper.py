@@ -523,3 +523,120 @@ def _paginated_scrape(
     except Exception:
         pass
     return jobs
+
+def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> list[dict]:
+    """
+    Indeed scraper with country-aware domain routing + Bright Data geo-targeting.
+    """
+    domain = _get_indeed_domain(location or "")
+    country, city = _get_indeed_geo(location or "", domain)
+
+    q = quote_plus(query)
+    l = quote_plus(location or "")
+
+    warmup_url = f"https://{domain}/"
+    base_url = f"https://{domain}/jobs?q={q}&l={l}"
+
+    def url_fn(pg: int) -> str:
+        start = pg * 10
+        return f"{base_url}&start={start}"
+
+    def parse_fn(soup: BeautifulSoup, fallback_location: str) -> list[dict]:
+        jobs = []
+        seen = set()
+
+        cards = soup.select(
+            "div.job_seen_beacon, "
+            "div.slider_container div[data-jk], "
+            "table.jobCard_mainContent, "
+            "a.tapItem"
+        )
+
+        for card in cards:
+            title_el = (
+                card.select_one("h2.jobTitle span[title]") or
+                card.select_one("h2.jobTitle") or
+                card.select_one("[data-testid='job-title']") or
+                card.select_one("a[data-jk]")
+            )
+            title = title_el.get_text(" ", strip=True) if title_el else None
+            if title and title.lower().startswith("new"):
+                title = title[3:].strip()
+
+            company_el = (
+                card.select_one("[data-testid='company-name']") or
+                card.select_one("span.companyName") or
+                card.select_one("div.heading6.company_location span")
+            )
+            company = company_el.get_text(" ", strip=True) if company_el else None
+
+            loc_el = (
+                card.select_one("[data-testid='job-location']") or
+                card.select_one("div.companyLocation") or
+                card.select_one("div.heading6.company_location div")
+            )
+            job_location = loc_el.get_text(" ", strip=True) if loc_el else (fallback_location or "")
+
+            link_el = card.select_one("a[href*='/rc/clk'], a[href*='/viewjob'], a[data-jk]")
+            url = None
+            if link_el:
+                href = link_el.get("href")
+                if href:
+                    url = href if href.startswith("http") else f"https://{domain}{href}"
+
+            if not url:
+                jk = card.get("data-jk")
+                if jk:
+                    url = f"https://{domain}/viewjob?jk={jk}"
+
+            if not title or not company or not url:
+                continue
+
+            if url in seen:
+                continue
+            seen.add(url)
+
+            salary_el = (
+                card.select_one(".salary-snippet") or
+                card.select_one("[data-testid='attribute_snippet_testid']") or
+                card.select_one(".estimated-salary")
+            )
+            salary = salary_el.get_text(" ", strip=True) if salary_el else None
+
+            snippet_el = (
+                card.select_one("[data-testid='job-snippet']") or
+                card.select_one(".job-snippet") or
+                card.select_one(".slider-snippet")
+            )
+            snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+
+            date_el = (
+                card.select_one("span.date") or
+                card.select_one(".date") or
+                card.select_one("[data-testid='myJobsStateDate']")
+            )
+            posted_at = parse_date(date_el.get_text(" ", strip=True)) if date_el else None
+
+            jobs.append({
+                "id": make_id(url),
+                "title": title,
+                "company": company,
+                "location": job_location,
+                "url": url,
+                "description": trunc(snippet, 400),
+                "salary": salary,
+                "posted_at": posted_at,
+                "source": "indeed",
+            })
+
+        return jobs
+
+    return _paginated_scrape(
+        warmup_url=warmup_url,
+        url_fn=url_fn,
+        parse_fn=parse_fn,
+        location=location,
+        max_pages=max_pages,
+        country=country,
+        city=city,
+    )

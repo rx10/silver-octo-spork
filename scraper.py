@@ -9,11 +9,11 @@ RemoteOK:     Public JSON API (no proxy needed)
 Glassdoor:    curl_cffi + proxy → HTML parse
 """
 
-import json, re, os, hashlib, random, string, time, logging
+import re, os, hashlib, random, string, time, logging
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from urllib.parse import quote_plus, quote, urlparse
-
+import base64
 from playwright.sync_api import sync_playwright, Playwright
 
 import httpx

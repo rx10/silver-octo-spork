@@ -2,27 +2,22 @@
 Job scraper — Dice, LinkedIn, Indeed, ZipRecruiter, RemoteOK, Glassdoor.
 
 Dice:         Playwright intercepts x-api-key once → httpx API calls
-LinkedIn:     curl_cffi (Chrome TLS fingerprint) + Bright Data sticky sessions
-Indeed:       Bright Data Unlocker API + geo-targeting → HTML parse
+LinkedIn:     curl_cffi (Chrome TLS fingerprint) + Oxylabs sticky sessions
+Indeed:       curl_cffi + Oxylabs residential geo-targeting → HTML parse
 ZipRecruiter: curl_cffi + proxy → HTML parse
 RemoteOK:     Public JSON API (no proxy needed)
 Glassdoor:    curl_cffi + proxy → HTML parse
 """
 
-import re, os, hashlib, random, string, time, logging
+import re, os, hashlib, random, string, time, logging, json
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from urllib.parse import quote_plus, quote, urlparse
 
 import httpx
-import requests
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
-
-BRIGHTDATA_API_KEY = os.environ.get("BRIGHTDATA_API_KEY")
-UNLOCKER_ZONE_NAME = os.environ.get("UNLOCKER_ZONE_NAME")
-UNLOCKER_ENDPOINT = "https://api.brightdata.com/request"
 
 MAX_RETRIES = 3
 
@@ -88,87 +83,6 @@ def parse_date(s: Optional[str]) -> Optional[str]:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).date().isoformat()
     except ValueError:
         return today.isoformat()
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  BRIGHT DATA UNLOCKER — with proper retry + backoff
-# ═══════════════════════════════════════════════════════════════════════
-
-def _unlocker_get_html(url: str, country: str | None = None, retries: int = 3) -> str:
-    """
-    Fetch a URL via Bright Data Unlocker API and return HTML as text.
-    Retries with increasing backoff on empty body or CAPTCHA.
-    """
-    if not BRIGHTDATA_API_KEY:
-        raise RuntimeError("Missing BRIGHTDATA_API_KEY env var")
-    if not UNLOCKER_ZONE_NAME:
-        raise RuntimeError("Missing UNLOCKER_ZONE_NAME env var")
-
-    headers = {
-        "Authorization": f"Bearer {BRIGHTDATA_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    payload: dict = {
-        "zone": UNLOCKER_ZONE_NAME,
-        "url": url,
-        "format": "raw",
-    }
-    if country:
-        payload["country"] = country.lower()
-
-    last_err = None
-    last_body = "(no response yet)"
-
-    for attempt in range(1, retries + 1):
-        try:
-            resp = requests.post(
-                UNLOCKER_ENDPOINT,
-                json=payload,
-                headers=headers,
-                timeout=120,
-            )
-
-            if not resp.ok:
-                last_body = resp.text[:500]
-                logger.error(
-                    "Unlocker HTTP %s for %s (attempt %d/%d): %r",
-                    resp.status_code, url, attempt, retries, last_body,
-                )
-                resp.raise_for_status()
-
-            html = resp.text
-            last_body = html[:500] if html else "(empty)"
-
-            if not html.strip():
-                raise RuntimeError("Unlocker returned empty body")
-
-            # Check for CAPTCHA/block pages
-            if len(html) < 2000 and ("captcha" in html.lower() or "unusual traffic" in html.lower()):
-                logger.warning(
-                    "Unlocker returned CAPTCHA/block for %s (attempt %d/%d)",
-                    url, attempt, retries,
-                )
-                raise RuntimeError("Unlocker returned CAPTCHA page")
-
-            return html
-
-        except Exception as e:
-            last_err = e
-            logger.warning(
-                "Unlocker failed for %s (attempt %d/%d): %s",
-                url, attempt, retries, e,
-            )
-            if attempt < retries:
-                wait = 3 * (2 ** (attempt - 1)) + random.uniform(0, 2)
-                logger.info(f"Retrying in {wait:.1f}s...")
-                time.sleep(wait)
-
-    logger.error(
-        "Unlocker exhausted %d attempts for %s, last body prefix=%r",
-        retries, url, last_body,
-    )
-    raise RuntimeError(f"Unlocker failed after {retries} attempts for {url}") from last_err
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -272,6 +186,7 @@ INDEED_COUNTRY_MAP = {
     ],
 }
 
+# Oxylabs geo-targeting: -cc-XX for country, -city-xxx for city
 INDEED_GEO_MAP = {
     "in.indeed.com": ("IN", {
         "hyderabad": "hyderabad", "secunderabad": "hyderabad",
@@ -394,10 +309,11 @@ def _get_indeed_geo(location: str, domain: str) -> tuple[Optional[str], Optional
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  PROXY — Bright Data sticky sessions + geo-targeting
+#  PROXY — Oxylabs residential sticky sessions + geo-targeting
 # ═══════════════════════════════════════════════════════════════════════
 
 class ProxyConfig:
+    """Lazy-loaded singleton for Oxylabs proxy settings."""
     _instance = None
 
     def __new__(cls):
@@ -410,45 +326,23 @@ class ProxyConfig:
         if self._loaded:
             return
         self._loaded = True
-
-        self.customer_id = None
-        self.password = None
-        self.zone = None
-        self.host = "brd.superproxy.io"
-        self.port = "33335"
-        self.raw_proxy_url = None
+        self.user = self.password = None
+        self.host, self.port = "pr.oxylabs.io", "7777"
 
         full = os.getenv("PROXY_URL", "").strip()
         if full:
-            self.raw_proxy_url = full
             p = urlparse(full)
-            self.password = p.password
+            self.user, self.password = p.username, p.password
             self.host = p.hostname or self.host
-            self.port = str(p.port or 33335)
-
-            username = p.username or ""
-            if username.startswith("brd-customer-"):
-                m_customer = re.search(r"brd-customer-([^-]+)", username)
-                m_zone = re.search(r"-zone-([^-]+)", username)
-                if m_customer:
-                    self.customer_id = m_customer.group(1)
-                if m_zone:
-                    self.zone = m_zone.group(1)
+            self.port = str(p.port or 7777)
         else:
-            self.customer_id = os.getenv("BRD_CUSTOMER_ID", "").strip() or None
-            self.password = os.getenv("BRD_PASSWORD", "").strip() or None
-            self.zone = os.getenv("BRD_ZONE", "").strip() or None
+            self.user = os.getenv("OXYLABS_USER", "").strip() or None
+            self.password = os.getenv("OXYLABS_PASS", "").strip() or None
 
-        if self.customer_id and self.zone:
-            logger.info(f"Proxy: brd-customer-{self.customer_id}-zone-{self.zone}@{self.host}:{self.port}")
-        elif self.raw_proxy_url:
-            logger.info(f"Proxy: custom PROXY_URL @ {self.host}:{self.port}")
+        if self.user:
+            logger.info(f"Proxy: {self.user}@{self.host}:{self.port}")
         else:
-            logger.warning("No Bright Data proxy configured — may get blocked on some sites")
-
-    @staticmethod
-    def _normalize_city(city: str) -> str:
-        return city.strip().lower().replace(" ", "").replace("_", "")
+            logger.warning("No Oxylabs proxy configured — may get blocked on some sites")
 
     def url(
         self,
@@ -456,19 +350,21 @@ class ProxyConfig:
         country: Optional[str] = None,
         city: Optional[str] = None,
     ) -> Optional[str]:
+        """
+        Build Oxylabs proxy URL with optional geo-targeting.
+        Appends -cc-XX for country and -city-xxx for city to the username.
+        """
         self._load()
-        if self.customer_id and self.password and self.zone:
-            user = f"brd-customer-{self.customer_id}-zone-{self.zone}"
-            if country:
-                user += f"-country-{country.lower()}"
-            if city:
-                user += f"-city-{self._normalize_city(city)}"
-            if sticky_session:
-                user += f"-session-{sticky_session}"
-            return f"http://{quote(user, safe='')}:{quote(self.password, safe='')}@{self.host}:{self.port}"
-        if self.raw_proxy_url:
-            return self.raw_proxy_url
-        return None
+        if not self.user or not self.password:
+            return None
+        user = self.user
+        if country:
+            user = f"{user}-cc-{country.upper()}"
+        if city:
+            user = f"{user}-city-{city.lower()}"
+        if sticky_session:
+            user = f"{user}-sessid-{sticky_session}"
+        return f"http://{quote(user, safe='')}:{quote(self.password, safe='')}@{self.host}:{self.port}"
 
 _proxy = ProxyConfig()
 
@@ -500,6 +396,7 @@ def _make_session(
     country: Optional[str] = None,
     city: Optional[str] = None,
 ):
+    """Return (session, is_curl). Supports Oxylabs geo-targeting."""
     proxy = _proxy.url(sticky_session=sid, country=country, city=city)
     if _check_curl():
         from curl_cffi import requests as curl_requests
@@ -512,7 +409,7 @@ def _make_session(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  GENERIC PAGINATED SCRAPER (for non-Unlocker sources)
+#  GENERIC PAGINATED SCRAPER
 # ═══════════════════════════════════════════════════════════════════════
 
 def _paginated_scrape(
@@ -529,11 +426,14 @@ def _paginated_scrape(
     country: Optional[str] = None,
     city: Optional[str] = None,
 ) -> list[dict]:
+    """Shared loop: session → warmup → paginate → parse → rotate on block.
+    curl_cffi maintains cookies across requests so pagination works."""
     sid = _new_sid()
     session, _ = _make_session(sid, country=country, city=city)
     jobs: list[dict] = []
     rotations_left = max_rotations
 
+    # Warmup — loads cookies
     try:
         session.get(warmup_url, headers=hdr(), timeout=15)
         delay(2, 4)
@@ -767,7 +667,7 @@ def scrape_linkedin(role: str, location: str, max_pages=3, max_details=15) -> li
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  INDEED — Bright Data Unlocker + adaptive pagination + dedup
+#  INDEED — curl_cffi + Oxylabs residential geo-targeting + cookies
 # ═══════════════════════════════════════════════════════════════════════
 
 def _parse_indeed_page(
@@ -775,7 +675,7 @@ def _parse_indeed_page(
     fallback_location: str,
     domain: str = "in.indeed.com",
 ) -> List[Dict]:
-    """Parse Indeed search results page. Returns list of job dicts."""
+    """Parse Indeed search results page."""
     jobs = []
     seen = set()
 
@@ -811,7 +711,6 @@ def _parse_indeed_page(
         )
         job_location = loc_el.get_text(" ", strip=True) if loc_el else (fallback_location or "")
 
-        # Extract URL
         link_el = card.select_one("a[href*='/rc/clk'], a[href*='/viewjob'], a[data-jk]")
         url = None
         if link_el:
@@ -866,6 +765,10 @@ def _parse_indeed_page(
 
 
 def scrape_indeed(query: str, location: str = "", max_pages: int = 5) -> List[Dict]:
+    """
+    Indeed scraper: curl_cffi session (cookies persist across pages)
+    + Oxylabs residential proxy with geo-targeting.
+    """
     domain = _get_indeed_domain(location or "")
     country, city = _get_indeed_geo(location or "", domain)
     logger.info(f"Indeed: domain={domain}, geo=({country}, {city}) for '{location}'")
@@ -884,8 +787,9 @@ def scrape_indeed(query: str, location: str = "", max_pages: int = 5) -> List[Di
         city=city,
     )
 
-    seen = set()
-    unique = []
+    # Deduplicate
+    seen: set = set()
+    unique: list = []
     for j in jobs:
         if j["url"] not in seen:
             seen.add(j["url"])
@@ -893,6 +797,7 @@ def scrape_indeed(query: str, location: str = "", max_pages: int = 5) -> List[Di
 
     logger.info(f"Indeed total: {len(unique)} unique jobs (domain: {domain})")
     return unique
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ZIPRECRUITER
@@ -1028,7 +933,6 @@ def scrape_remoteok(role: str, location: str = "Remote", max_results=60) -> list
 # ═══════════════════════════════════════════════════════════════════════
 
 def _parse_glassdoor(soup: BeautifulSoup, fallback_loc: str) -> list[dict]:
-    import json
     jobs = []
 
     for script in soup.select('script[type="application/ld+json"]'):

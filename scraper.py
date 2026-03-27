@@ -560,10 +560,6 @@ def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> List[Di
     """
     Indeed scraper with country-aware domain routing + Bright Data Unlocker API.
     """
-    html = _unlocker_get_html(url, country=country)
-    soup = BeautifulSoup(html, "html.parser")
-    page_jobs = parse_fn(soup, fallback_location=location or "")
-
     domain = _get_indeed_domain(location or "")
     country, city = _get_indeed_geo(location or "", domain)
 

@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import base64
+from playwright.sync_api import sync_playwright
 from playwright.sync_api import Playwright
 
 BROWSER_API_USERNAME = os.environ.get("BROWSER_API_USERNAME")

@@ -3,7 +3,7 @@ Job scraper — Dice, LinkedIn, Indeed, ZipRecruiter, RemoteOK, Glassdoor.
 
 Dice:         Playwright intercepts x-api-key once → httpx API calls
 LinkedIn:     curl_cffi (Chrome TLS fingerprint) + Oxylabs sticky sessions
-Indeed:       curl_cffi + proxy → HTML parse (auto-detects in.indeed.com for India)
+Indeed:       curl_cffi + proxy + Oxylabs geo-targeting → HTML parse
 ZipRecruiter: curl_cffi + proxy → HTML parse
 RemoteOK:    Public JSON API (no proxy needed)
 Glassdoor:    curl_cffi + proxy → HTML parse
@@ -86,11 +86,10 @@ def parse_date(s: Optional[str]) -> Optional[str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  INDEED DOMAIN DETECTION — country-aware routing
+#  INDEED DOMAIN + GEO DETECTION — country-aware routing
 # ═══════════════════════════════════════════════════════════════════════
 
 # Map of location keywords → Indeed country subdomain
-# Matches against lowercased location string
 INDEED_COUNTRY_MAP = {
     "in.indeed.com": [
         # Major metros
@@ -168,9 +167,6 @@ INDEED_COUNTRY_MAP = {
     "sg.indeed.com": [
         "singapore",
     ],
-    "www.indeed.com.sg": [
-        # alternate pattern — sg.indeed.com is the primary
-    ],
     "jp.indeed.com": [
         "tokyo", "osaka", "kyoto", "yokohama", "nagoya", "sapporo",
         "fukuoka", "kobe", "sendai", "hiroshima", "japan",
@@ -196,6 +192,114 @@ INDEED_COUNTRY_MAP = {
     ],
 }
 
+# Country code + optional city for Oxylabs geo-targeting per Indeed domain
+INDEED_GEO_MAP = {
+    "in.indeed.com": ("IN", {
+        "hyderabad": "hyderabad", "secunderabad": "hyderabad",
+        "madhapur": "hyderabad", "hitec city": "hyderabad",
+        "hitech city": "hyderabad", "gachibowli": "hyderabad",
+        "kondapur": "hyderabad", "kukatpally": "hyderabad",
+        "ameerpet": "hyderabad",
+        "bangalore": "bangalore", "bengaluru": "bangalore",
+        "whitefield": "bangalore", "electronic city": "bangalore",
+        "marathahalli": "bangalore", "koramangala": "bangalore",
+        "indiranagar": "bangalore", "hsr layout": "bangalore",
+        "mumbai": "mumbai", "navi mumbai": "mumbai",
+        "andheri": "mumbai", "powai": "mumbai",
+        "bandra": "mumbai", "lower parel": "mumbai",
+        "thane": "mumbai",
+        "delhi": "delhi", "new delhi": "delhi",
+        "noida": "delhi", "greater noida": "delhi",
+        "gurgaon": "delhi", "gurugram": "delhi",
+        "faridabad": "delhi", "ghaziabad": "delhi",
+        "chennai": "chennai",
+        "pune": "pune",
+        "kolkata": "kolkata",
+        "ahmedabad": "ahmedabad",
+        "jaipur": "jaipur",
+        "lucknow": "lucknow",
+        "chandigarh": "chandigarh", "mohali": "chandigarh",
+        "panchkula": "chandigarh",
+        "indore": "indore",
+        "nagpur": "nagpur",
+        "coimbatore": "coimbatore",
+        "kochi": "kochi", "cochin": "kochi",
+        "thiruvananthapuram": "thiruvananthapuram",
+        "trivandrum": "thiruvananthapuram",
+        "visakhapatnam": "visakhapatnam", "vizag": "visakhapatnam",
+        "bhubaneswar": "bhubaneswar",
+        "mysore": "mysore", "mysuru": "mysore",
+        "vadodara": "vadodara",
+        "surat": "surat",
+        "patna": "patna",
+        "ranchi": "ranchi",
+        "bhopal": "bhopal",
+        "guwahati": "guwahati",
+        "dehradun": "dehradun",
+    }),
+    "uk.indeed.com": ("GB", {
+        "london": "london", "manchester": "manchester",
+        "birmingham": "birmingham", "leeds": "leeds",
+        "glasgow": "glasgow", "edinburgh": "edinburgh",
+        "liverpool": "liverpool", "bristol": "bristol",
+        "sheffield": "sheffield", "cardiff": "cardiff",
+        "belfast": "belfast", "nottingham": "nottingham",
+        "newcastle": "newcastle", "southampton": "southampton",
+        "cambridge": "cambridge", "oxford": "oxford",
+        "brighton": "brighton", "leicester": "leicester",
+    }),
+    "de.indeed.com": ("DE", {
+        "berlin": "berlin", "munich": "munich", "münchen": "munich",
+        "hamburg": "hamburg", "frankfurt": "frankfurt",
+        "cologne": "cologne", "köln": "cologne",
+        "düsseldorf": "dusseldorf", "stuttgart": "stuttgart",
+        "leipzig": "leipzig", "dresden": "dresden",
+        "hannover": "hannover", "nuremberg": "nuremberg",
+    }),
+    "ca.indeed.com": ("CA", {
+        "toronto": "toronto", "vancouver": "vancouver",
+        "montreal": "montreal", "montréal": "montreal",
+        "calgary": "calgary", "edmonton": "edmonton",
+        "ottawa": "ottawa", "winnipeg": "winnipeg",
+        "quebec": "quebec", "hamilton": "hamilton",
+        "halifax": "halifax",
+    }),
+    "au.indeed.com": ("AU", {
+        "sydney": "sydney", "melbourne": "melbourne",
+        "brisbane": "brisbane", "perth": "perth",
+        "adelaide": "adelaide", "gold coast": "gold_coast",
+        "canberra": "canberra", "hobart": "hobart",
+        "darwin": "darwin",
+    }),
+    "sg.indeed.com": ("SG", {
+        "singapore": "singapore",
+    }),
+    "jp.indeed.com": ("JP", {
+        "tokyo": "tokyo", "osaka": "osaka",
+        "kyoto": "kyoto", "yokohama": "yokohama",
+        "nagoya": "nagoya", "fukuoka": "fukuoka",
+    }),
+    "ae.indeed.com": ("AE", {
+        "dubai": "dubai", "abu dhabi": "abu_dhabi",
+        "sharjah": "sharjah",
+    }),
+    "nl.indeed.com": ("NL", {
+        "amsterdam": "amsterdam", "rotterdam": "rotterdam",
+        "the hague": "the_hague", "den haag": "the_hague",
+        "utrecht": "utrecht", "eindhoven": "eindhoven",
+    }),
+    "fr.indeed.com": ("FR", {
+        "paris": "paris", "lyon": "lyon",
+        "marseille": "marseille", "toulouse": "toulouse",
+        "nice": "nice", "bordeaux": "bordeaux",
+        "lille": "lille", "strasbourg": "strasbourg",
+    }),
+    "ie.indeed.com": ("IE", {
+        "dublin": "dublin", "cork": "cork",
+        "galway": "galway", "limerick": "limerick",
+    }),
+}
+
 
 def _get_indeed_domain(location: str) -> str:
     """Return the correct Indeed subdomain for the given location."""
@@ -203,12 +307,26 @@ def _get_indeed_domain(location: str) -> str:
     for domain, keywords in INDEED_COUNTRY_MAP.items():
         if any(kw in loc for kw in keywords):
             return domain
-    # Default to US
     return "www.indeed.com"
 
 
+def _get_indeed_geo(location: str, domain: str) -> tuple[Optional[str], Optional[str]]:
+    """Return (country_code, city) for Oxylabs geo-targeting."""
+    geo = INDEED_GEO_MAP.get(domain)
+    if not geo:
+        return None, None
+    country_code, city_map = geo
+    loc = location.lower().strip()
+    city = None
+    for keyword, city_name in city_map.items():
+        if keyword in loc:
+            city = city_name
+            break
+    return country_code, city
+
+
 # ═══════════════════════════════════════════════════════════════════════
-#  PROXY — Oxylabs sticky sessions
+#  PROXY — Oxylabs sticky sessions + geo-targeting
 # ═══════════════════════════════════════════════════════════════════════
 
 class ProxyConfig:
@@ -243,11 +361,27 @@ class ProxyConfig:
         else:
             logger.warning("No proxy configured — may get blocked on some sites")
 
-    def url(self, sticky_session: Optional[str] = None) -> Optional[str]:
+    def url(
+        self,
+        sticky_session: Optional[str] = None,
+        country: Optional[str] = None,
+        city: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Build proxy URL with optional Oxylabs geo-targeting.
+        Appends -cc-XX for country and -city-xxx for city to the username.
+        """
         self._load()
         if not self.user or not self.password:
             return None
-        user = f"{self.user}-sessid-{sticky_session}" if sticky_session else self.user
+        user = self.user
+        # Oxylabs geo-targeting suffixes
+        if country:
+            user = f"{user}-cc-{country.upper()}"
+        if city:
+            user = f"{user}-city-{city.lower()}"
+        if sticky_session:
+            user = f"{user}-sessid-{sticky_session}"
         return f"http://{quote(user, safe='')}:{quote(self.password, safe='')}@{self.host}:{self.port}"
 
 _proxy = ProxyConfig()
@@ -275,9 +409,14 @@ def _check_curl():
     return _has_curl_cffi
 
 
-def _make_session(sid: Optional[str] = None):
-    """Return (session, is_curl). Session has .get()/.close()."""
-    proxy = _proxy.url(sid)
+def _make_session(
+    sid: Optional[str] = None,
+    country: Optional[str] = None,
+    city: Optional[str] = None,
+):
+    """Return (session, is_curl). Session has .get()/.close().
+    Supports Oxylabs geo-targeting via country/city params."""
+    proxy = _proxy.url(sticky_session=sid, country=country, city=city)
     if _check_curl():
         from curl_cffi import requests as curl_requests
         proxies = {"http": proxy, "https": proxy} if proxy else None
@@ -303,10 +442,13 @@ def _paginated_scrape(
     delay_range: tuple = (2, 5),
     backoff_base: float = 10.0,
     max_rotations: int = 3,
+    country: Optional[str] = None,
+    city: Optional[str] = None,
 ) -> list[dict]:
-    """Shared loop: session → warmup → paginate → parse → rotate on block."""
+    """Shared loop: session → warmup → paginate → parse → rotate on block.
+    Supports Oxylabs geo-targeting via country/city params."""
     sid = _new_sid()
-    session, _ = _make_session(sid)
+    session, _ = _make_session(sid, country=country, city=city)
     jobs: list[dict] = []
     rotations_left = max_rotations
 
@@ -334,7 +476,7 @@ def _paginated_scrape(
                         session.close()
                     except Exception:
                         pass
-                    session, _ = _make_session(sid)
+                    session, _ = _make_session(sid, country=country, city=city)
                     try:
                         session.get(warmup_url, headers=hdr(), timeout=15)
                         delay(2, 4)
@@ -547,7 +689,7 @@ def scrape_linkedin(role: str, location: str, max_pages=3, max_details=15) -> li
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  INDEED — auto-detects country domain from location
+#  INDEED — geo-targeted proxy + country domain routing
 # ═══════════════════════════════════════════════════════════════════════
 
 def _parse_indeed(soup: BeautifulSoup, fallback_loc: str, domain: str = "www.indeed.com") -> list[dict]:
@@ -587,7 +729,8 @@ def _parse_indeed(soup: BeautifulSoup, fallback_loc: str, domain: str = "www.ind
 
 def scrape_indeed(role: str, location: str, max_pages=5) -> list[dict]:
     domain = _get_indeed_domain(location)
-    logger.info(f"Indeed: using domain {domain} for location '{location}'")
+    country, city = _get_indeed_geo(location, domain)
+    logger.info(f"Indeed: domain={domain}, geo=({country}, {city}) for '{location}'")
 
     jobs = _paginated_scrape(
         warmup_url=f"https://{domain}/",
@@ -598,8 +741,10 @@ def scrape_indeed(role: str, location: str, max_pages=5) -> list[dict]:
         parse_fn=lambda soup, loc: _parse_indeed(soup, loc, domain),
         location=location,
         max_pages=max_pages,
+        country=country,
+        city=city,
     )
-    logger.info(f"Indeed total: {len(jobs)} (domain: {domain})")
+    logger.info(f"Indeed total: {len(jobs)} (domain: {domain}, geo: {country}/{city})")
     return jobs
 
 

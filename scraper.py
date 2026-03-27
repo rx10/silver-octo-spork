@@ -3,7 +3,7 @@ Job scraper — Dice, LinkedIn, Indeed, ZipRecruiter, RemoteOK, Glassdoor.
 
 Dice:         Playwright intercepts x-api-key once → httpx API calls
 LinkedIn:     curl_cffi (Chrome TLS fingerprint) + Oxylabs sticky sessions
-Indeed:       curl_cffi + proxy → HTML parse
+Indeed:       curl_cffi + proxy → HTML parse (auto-detects in.indeed.com for India)
 ZipRecruiter: curl_cffi + proxy → HTML parse
 RemoteOK:    Public JSON API (no proxy needed)
 Glassdoor:    curl_cffi + proxy → HTML parse
@@ -83,6 +83,128 @@ def parse_date(s: Optional[str]) -> Optional[str]:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).date().isoformat()
     except ValueError:
         return today.isoformat()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  INDEED DOMAIN DETECTION — country-aware routing
+# ═══════════════════════════════════════════════════════════════════════
+
+# Map of location keywords → Indeed country subdomain
+# Matches against lowercased location string
+INDEED_COUNTRY_MAP = {
+    "in.indeed.com": [
+        # Major metros
+        "hyderabad", "bangalore", "bengaluru", "mumbai", "delhi",
+        "new delhi", "chennai", "pune", "kolkata", "noida",
+        "gurgaon", "gurugram", "ahmedabad", "jaipur", "lucknow",
+        "chandigarh", "indore", "nagpur", "coimbatore", "kochi",
+        "cochin", "thiruvananthapuram", "trivandrum", "visakhapatnam",
+        "vizag", "bhubaneswar", "mysore", "mysuru", "mangalore",
+        "mangaluru", "madurai", "vadodara", "surat", "rajkot",
+        "patna", "ranchi", "bhopal", "guwahati", "dehradun",
+        "agra", "varanasi", "kanpur", "allahabad", "prayagraj",
+        "amritsar", "ludhiana", "jalandhar", "jodhpur", "udaipur",
+        "nashik", "aurangabad", "thane", "navi mumbai",
+        "faridabad", "ghaziabad", "greater noida", "mohali",
+        "panchkula", "hubli", "belgaum", "belagavi", "salem",
+        "tiruchirappalli", "trichy", "tiruppur", "erode",
+        "vijayawada", "guntur", "warangal", "karimnagar",
+        "secunderabad", "madhapur", "hitec city", "hitech city",
+        "gachibowli", "kondapur", "kukatpally", "ameerpet",
+        "whitefield", "electronic city", "marathahalli",
+        "koramangala", "indiranagar", "hsr layout",
+        "andheri", "powai", "bandra", "lower parel",
+        # States & regions
+        "telangana", "karnataka", "maharashtra", "tamil nadu",
+        "tamilnadu", "kerala", "andhra pradesh", "west bengal",
+        "uttar pradesh", "rajasthan", "gujarat", "madhya pradesh",
+        "bihar", "odisha", "orissa", "punjab", "haryana",
+        "jharkhand", "chhattisgarh", "uttarakhand", "himachal",
+        "assam", "goa",
+        # Generic
+        "india",
+    ],
+    "uk.indeed.com": [
+        "london", "manchester", "birmingham", "leeds", "glasgow",
+        "edinburgh", "liverpool", "bristol", "sheffield", "cardiff",
+        "belfast", "nottingham", "newcastle", "southampton",
+        "cambridge", "oxford", "reading", "brighton", "leicester",
+        "coventry", "aberdeen", "dundee", "swansea", "york",
+        "bath", "exeter", "norwich", "plymouth", "portsmouth",
+        "milton keynes", "luton", "wolverhampton", "derby",
+        "stoke", "sunderland", "middlesbrough", "warwick",
+        "england", "scotland", "wales", "northern ireland",
+        "united kingdom", "uk", "britain", "great britain",
+    ],
+    "de.indeed.com": [
+        "berlin", "munich", "münchen", "hamburg", "frankfurt",
+        "cologne", "köln", "düsseldorf", "stuttgart", "dortmund",
+        "essen", "leipzig", "bremen", "dresden", "hannover",
+        "nuremberg", "nürnberg", "duisburg", "bochum", "wuppertal",
+        "bielefeld", "bonn", "karlsruhe", "mannheim", "augsburg",
+        "wiesbaden", "aachen", "freiburg", "heidelberg",
+        "germany", "deutschland",
+    ],
+    "ca.indeed.com": [
+        "toronto", "vancouver", "montreal", "montréal", "calgary",
+        "edmonton", "ottawa", "winnipeg", "quebec", "hamilton",
+        "kitchener", "waterloo", "london ontario", "victoria",
+        "halifax", "saskatoon", "regina", "st. john", "kelowna",
+        "barrie", "oshawa", "guelph", "kingston", "thunder bay",
+        "ontario", "british columbia", "alberta", "quebec province",
+        "manitoba", "saskatchewan", "nova scotia", "new brunswick",
+        "canada",
+    ],
+    "au.indeed.com": [
+        "sydney", "melbourne", "brisbane", "perth", "adelaide",
+        "gold coast", "canberra", "hobart", "darwin", "newcastle nsw",
+        "wollongong", "geelong", "townsville", "cairns", "toowoomba",
+        "ballarat", "bendigo", "launceston", "mackay", "rockhampton",
+        "new south wales", "nsw", "victoria au", "queensland",
+        "western australia", "south australia", "tasmania",
+        "northern territory", "act",
+        "australia",
+    ],
+    "sg.indeed.com": [
+        "singapore",
+    ],
+    "www.indeed.com.sg": [
+        # alternate pattern — sg.indeed.com is the primary
+    ],
+    "jp.indeed.com": [
+        "tokyo", "osaka", "kyoto", "yokohama", "nagoya", "sapporo",
+        "fukuoka", "kobe", "sendai", "hiroshima", "japan",
+    ],
+    "ae.indeed.com": [
+        "dubai", "abu dhabi", "sharjah", "ajman", "ras al khaimah",
+        "fujairah", "al ain", "uae", "united arab emirates",
+    ],
+    "nl.indeed.com": [
+        "amsterdam", "rotterdam", "the hague", "den haag", "utrecht",
+        "eindhoven", "tilburg", "groningen", "almere", "breda",
+        "netherlands", "holland",
+    ],
+    "fr.indeed.com": [
+        "paris", "lyon", "marseille", "toulouse", "nice",
+        "nantes", "strasbourg", "montpellier", "bordeaux", "lille",
+        "rennes", "reims", "toulon", "grenoble", "dijon",
+        "france",
+    ],
+    "ie.indeed.com": [
+        "dublin", "cork", "galway", "limerick", "waterford",
+        "ireland",
+    ],
+}
+
+
+def _get_indeed_domain(location: str) -> str:
+    """Return the correct Indeed subdomain for the given location."""
+    loc = location.lower().strip()
+    for domain, keywords in INDEED_COUNTRY_MAP.items():
+        if any(kw in loc for kw in keywords):
+            return domain
+    # Default to US
+    return "www.indeed.com"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -425,10 +547,10 @@ def scrape_linkedin(role: str, location: str, max_pages=3, max_details=15) -> li
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  INDEED
+#  INDEED — auto-detects country domain from location
 # ═══════════════════════════════════════════════════════════════════════
 
-def _parse_indeed(soup: BeautifulSoup, fallback_loc: str) -> list[dict]:
+def _parse_indeed(soup: BeautifulSoup, fallback_loc: str, domain: str = "www.indeed.com") -> list[dict]:
     jobs = []
     cards = soup.select("div.job_seen_beacon, div.jobsearch-SerpJobCard, li.css-5lfssm")
     for card in cards:
@@ -438,7 +560,7 @@ def _parse_indeed(soup: BeautifulSoup, fallback_loc: str) -> list[dict]:
             continue
         href = link_el.get("href", "")
         if href.startswith("/"):
-            href = f"https://www.indeed.com{href}"
+            href = f"https://{domain}{href}"
         if not href.startswith("http"):
             continue
         company_el = card.select_one("span[data-testid='company-name'], span.companyName")
@@ -464,17 +586,20 @@ def _parse_indeed(soup: BeautifulSoup, fallback_loc: str) -> list[dict]:
 
 
 def scrape_indeed(role: str, location: str, max_pages=5) -> list[dict]:
+    domain = _get_indeed_domain(location)
+    logger.info(f"Indeed: using domain {domain} for location '{location}'")
+
     jobs = _paginated_scrape(
-        warmup_url="https://www.indeed.com/",
+        warmup_url=f"https://{domain}/",
         url_fn=lambda pg: (
-            f"https://www.indeed.com/jobs"
+            f"https://{domain}/jobs"
             f"?q={quote_plus(role)}&l={quote_plus(location)}&start={pg * 10}"
         ),
-        parse_fn=_parse_indeed,
+        parse_fn=lambda soup, loc: _parse_indeed(soup, loc, domain),
         location=location,
         max_pages=max_pages,
     )
-    logger.info(f"Indeed total: {len(jobs)}")
+    logger.info(f"Indeed total: {len(jobs)} (domain: {domain})")
     return jobs
 
 

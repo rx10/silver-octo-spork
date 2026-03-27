@@ -19,22 +19,28 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
+import os
 import base64
-from playwright.sync_api import sync_playwright
-from bs4 import BeautifulSoup
+from playwright.sync_api import Playwright
 
-BROWSER_API_USERNAME = "SBR_ZONE_FULL_USERNAME"
-BROWSER_API_PASSWORD = "SBR_ZONE_PASSWORD"
+BROWSER_API_USERNAME = os.environ.get("BROWSER_API_USERNAME")
+BROWSER_API_PASSWORD = os.environ.get("BROWSER_API_PASSWORD")
 
-def _connect_browser_api(pw):
+def _connect_browser_api(pw: Playwright):
+    if not BROWSER_API_USERNAME or not BROWSER_API_PASSWORD:
+        raise RuntimeError(
+            "Missing BROWSER_API_USERNAME or BROWSER_API_PASSWORD env vars. "
+            "Set them to your Browser API access details."
+        )
+
     auth = f"{BROWSER_API_USERNAME}:{BROWSER_API_PASSWORD}"
     auth_header = "Basic " + base64.b64encode(auth.encode()).decode()
+
     browser = pw.chromium.connect_over_cdp(
         endpoint_url="wss://brd.superproxy.io:9222",
         headers={"Authorization": auth_header},
     )
     return browser
-
 
 MAX_RETRIES = 3
 

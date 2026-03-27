@@ -473,14 +473,16 @@ def _make_session(
 #  GENERIC PAGINATED SCRAPER
 # ═══════════════════════════════════════════════════════════════════════
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
 def _paginated_scrape_browser(
     warmup_url: str,
     url_fn,
     parse_fn,
     location: str,
     max_pages: int,
-) -> List[Dict]:
-    results: List[Dict] = []
+) -> list[dict]:
+    results: list[dict] = []
 
     with sync_playwright() as pw:
         browser = _connect_browser_api(pw)
@@ -489,19 +491,31 @@ def _paginated_scrape_browser(
 
             # Warmup
             logger.info(f"Warmup: {warmup_url}")
-            page.goto(warmup_url, wait_until="networkidle", timeout=120_000)
+            page.goto(warmup_url, wait_until="domcontentloaded", timeout=60_000)
 
             for pg in range(max_pages):
                 url = url_fn(pg)
                 logger.info(f"Page {pg}: {url}")
-                page.goto(url, wait_until="networkidle", timeout=120_000)
+
+                try:
+                    # Slightly less strict than "networkidle"
+                    page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                except PlaywrightTimeoutError as e:
+                    logger.warning(f"Page {pg}: goto timeout, stopping pagination: {e}")
+                    break
+                except Exception as e:
+                    logger.warning(f"Page {pg}: goto failed with {type(e).__name__}: {e}")
+                    break
+
                 html = page.content()
                 soup = BeautifulSoup(html, "html.parser")
                 page_jobs = parse_fn(soup, fallback_location=location or "")
                 logger.info(f"Page {pg}: parsed {len(page_jobs)} jobs")
+
                 if not page_jobs:
                     # Stop if a page yields no jobs
                     break
+
                 results.extend(page_jobs)
         finally:
             browser.close()
@@ -513,7 +527,7 @@ from urllib.parse import quote_plus
 
 from urllib.parse import quote_plus
 
-def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> List[Dict]:
+def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> list[dict]:    
     """
     Indeed scraper with country-aware domain routing + Bright Data Browser API.
     """
@@ -632,5 +646,4 @@ def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> List[Di
         return jobs
     except Exception:
         logger.exception("scrape_indeed failed")
-        # Always return a list, never None
         return []

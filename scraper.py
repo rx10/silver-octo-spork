@@ -11,8 +11,10 @@ Glassdoor:    curl_cffi + proxy → HTML parse
 
 import json, re, os, hashlib, random, string, time, logging
 from datetime import datetime, timedelta
-from typing import Optional, Callable, List, Dict
+from typing import Optional, List, Dict
 from urllib.parse import quote_plus, quote, urlparse
+
+from playwright.sync_api import sync_playwright, Playwright
 
 import httpx
 from bs4 import BeautifulSoup

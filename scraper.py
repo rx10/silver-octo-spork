@@ -653,32 +653,30 @@ def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> list[di
                 "source": "indeed",
             })
 
-        return jobs
+        results: list[dict] = []
 
-    results: list[dict] = []
+        with sync_playwright() as pw:
+            browser = _connect_browser_api(pw)
+            try:
+                page = browser.new_page()
 
-    with sync_playwright() as pw:
-        browser = _connect_browser_api(pw)
-        try:
-            page = browser.new_page()
+                # Optional: geo-targeting via Browser API (country/city)
+                # You can also configure geo in the Browser API configuration itself.
+                # Example: page.set_extra_http_headers({"x-bd-geo-country": country})
 
-            # Optional: geo-targeting via Browser API (country/city)
-            # You can also configure geo in the Browser API configuration itself.
-            # Example: page.set_extra_http_headers({"x-bd-geo-country": country})
+                # Warmup
+                page.goto(warmup_url, wait_until="networkidle", timeout=120_000)
 
-            # Warmup
-            page.goto(warmup_url, wait_until="networkidle", timeout=120_000)
+                for pg in range(max_pages):
+                    url = url_fn(pg)
+                    page.goto(url, wait_until="networkidle", timeout=120_000)
+                    html = page.content()
+                    soup = BeautifulSoup(html, "html.parser")
+                    page_jobs = parse_fn(soup, fallback_location=location or "")
+                    if not page_jobs:
+                        break
+                    results.extend(page_jobs)
+            finally:
+                browser.close()
 
-            for pg in range(max_pages):
-                url = url_fn(pg)
-                page.goto(url, wait_until="networkidle", timeout=120_000)
-                html = page.content()
-                soup = BeautifulSoup(html, "html.parser")
-                page_jobs = parse_fn(soup, fallback_location=location or "")
-                if not page_jobs:
-                    break
-                results.extend(page_jobs)
-        finally:
-            browser.close()
-
-    return results
+        return results

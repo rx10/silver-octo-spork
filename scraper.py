@@ -19,6 +19,23 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
+import base64
+from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
+
+BROWSER_API_USERNAME = "SBR_ZONE_FULL_USERNAME"
+BROWSER_API_PASSWORD = "SBR_ZONE_PASSWORD"
+
+def _connect_browser_api(pw):
+    auth = f"{BROWSER_API_USERNAME}:{BROWSER_API_PASSWORD}"
+    auth_header = "Basic " + base64.b64encode(auth.encode()).decode()
+    browser = pw.chromium.connect_over_cdp(
+        endpoint_url="wss://brd.superproxy.io:9222",
+        headers={"Authorization": auth_header},
+    )
+    return browser
+
+
 MAX_RETRIES = 3
 
 USER_AGENTS = [
@@ -524,10 +541,10 @@ def _paginated_scrape(
         pass
     return jobs
 
+
+from urllib.parse import quote_plus
+
 def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> list[dict]:
-    """
-    Indeed scraper with country-aware domain routing + Bright Data geo-targeting.
-    """
     domain = _get_indeed_domain(location or "")
     country, city = _get_indeed_geo(location or "", domain)
 
@@ -631,12 +648,30 @@ def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> list[di
 
         return jobs
 
-    return _paginated_scrape(
-        warmup_url=warmup_url,
-        url_fn=url_fn,
-        parse_fn=parse_fn,
-        location=location,
-        max_pages=max_pages,
-        country=country,
-        city=city,
-    )
+    results: list[dict] = []
+
+    with sync_playwright() as pw:
+        browser = _connect_browser_api(pw)
+        try:
+            page = browser.new_page()
+
+            # Optional: geo-targeting via Browser API (country/city)
+            # You can also configure geo in the Browser API configuration itself.
+            # Example: page.set_extra_http_headers({"x-bd-geo-country": country})
+
+            # Warmup
+            page.goto(warmup_url, wait_until="networkidle", timeout=120_000)
+
+            for pg in range(max_pages):
+                url = url_fn(pg)
+                page.goto(url, wait_until="networkidle", timeout=120_000)
+                html = page.content()
+                soup = BeautifulSoup(html, "html.parser")
+                page_jobs = parse_fn(soup, fallback_location=location or "")
+                if not page_jobs:
+                    break
+                results.extend(page_jobs)
+        finally:
+            browser.close()
+
+    return results

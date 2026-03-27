@@ -21,26 +21,48 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-BROWSER_API_USERNAME = os.environ.get("BROWSER_API_USERNAME")
-BROWSER_API_PASSWORD = os.environ.get("BROWSER_API_PASSWORD")
+import os
+import requests
+from bs4 import BeautifulSoup
 
-def _connect_browser_api(pw: Playwright):
-    if not BROWSER_API_USERNAME or not BROWSER_API_PASSWORD:
-        raise RuntimeError(
-            "Missing BROWSER_API_USERNAME or BROWSER_API_PASSWORD env vars. "
-            "Set them to your Browser API access details."
-        )
+BRIGHTDATA_API_KEY = os.environ.get("BRIGHTDATA_API_KEY")
+UNLOCKER_ZONE_NAME = os.environ.get("UNLOCKER_ZONE_NAME")
 
-    auth = f"{BROWSER_API_USERNAME}:{BROWSER_API_PASSWORD}"
-    auth_header = "Basic " + base64.b64encode(auth.encode()).decode()
+UNLOCKER_ENDPOINT = "https://api.brightdata.com/request"
 
-    logger.info("Connecting to Browser API via wss://brd.superproxy.io:9222")
-    browser = pw.chromium.connect_over_cdp(
-        endpoint_url="wss://brd.superproxy.io:9222",
-        headers={"Authorization": auth_header},
-    )
-    logger.info("Connected to Browser API")
-    return browser
+def _unlocker_get_html(url: str, country: str | None = None) -> str:
+    """
+    Fetch a URL via Bright Data Unlocker API and return HTML as text.
+    """
+    if not BRIGHTDATA_API_KEY:
+        raise RuntimeError("Missing BRIGHTDATA_API_KEY env var")
+    if not UNLOCKER_ZONE_NAME:
+        raise RuntimeError("Missing UNLOCKER_ZONE_NAME env var")
+
+    headers = {
+        "Authorization": f"Bearer {BRIGHTDATA_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload: dict = {
+        "zone": UNLOCKER_ZONE_NAME,
+        "url": url,
+        "format": "raw",  # raw response from target site
+    }
+
+    # Optional: geo-targeting if you want to align with your _get_indeed_geo
+    if country:
+        payload["country"] = country.lower()
+
+    resp = requests.post(UNLOCKER_ENDPOINT, json=payload, headers=headers, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Unlocker returns JSON with "body" containing the HTML
+    body = data.get("body")
+    if body is None:
+        raise RuntimeError(f"Unlocker response missing 'body' for {url}")
+    return body
 
 MAX_RETRIES = 3
 
@@ -475,50 +497,40 @@ def _make_session(
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-def _paginated_scrape_browser(
+def _paginated_scrape_unlocker(
     warmup_url: str,
     url_fn,
     parse_fn,
     location: str,
     max_pages: int,
+    country: str | None = None,
 ) -> list[dict]:
     results: list[dict] = []
 
-    with sync_playwright() as pw:
-        browser = _connect_browser_api(pw)
+    # Optional warmup – not strictly required, but you can keep it
+    try:
+        _ = _unlocker_get_html(warmup_url, country=country)
+    except Exception as e:
+        logger.warning(f"Warmup failed for {warmup_url}: {e}")
+
+    for pg in range(max_pages):
+        url = url_fn(pg)
+        logger.info(f"Page {pg}: {url}")
+
         try:
-            page = browser.new_page()
+            html = _unlocker_get_html(url, country=country)
+        except Exception as e:
+            logger.warning(f"Page {pg}: Unlocker request failed, stopping pagination: {e}")
+            break
 
-            # Warmup
-            logger.info(f"Warmup: {warmup_url}")
-            page.goto(warmup_url, wait_until="domcontentloaded", timeout=60_000)
+        soup = BeautifulSoup(html, "html.parser")
+        page_jobs = parse_fn(soup, fallback_location=location or "")
+        logger.info(f"Page {pg}: parsed {len(page_jobs)} jobs")
 
-            for pg in range(max_pages):
-                url = url_fn(pg)
-                logger.info(f"Page {pg}: {url}")
+        if not page_jobs:
+            break
 
-                try:
-                    # Slightly less strict than "networkidle"
-                    page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                except PlaywrightTimeoutError as e:
-                    logger.warning(f"Page {pg}: goto timeout, stopping pagination: {e}")
-                    break
-                except Exception as e:
-                    logger.warning(f"Page {pg}: goto failed with {type(e).__name__}: {e}")
-                    break
-
-                html = page.content()
-                soup = BeautifulSoup(html, "html.parser")
-                page_jobs = parse_fn(soup, fallback_location=location or "")
-                logger.info(f"Page {pg}: parsed {len(page_jobs)} jobs")
-
-                if not page_jobs:
-                    # Stop if a page yields no jobs
-                    break
-
-                results.extend(page_jobs)
-        finally:
-            browser.close()
+        results.extend(page_jobs)
 
     return results
 
@@ -527,9 +539,12 @@ from urllib.parse import quote_plus
 
 from urllib.parse import quote_plus
 
-def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> list[dict]:    
+from urllib.parse import quote_plus
+from typing import List, Dict
+
+def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> List[Dict]:
     """
-    Indeed scraper with country-aware domain routing + Bright Data Browser API.
+    Indeed scraper with country-aware domain routing + Bright Data Unlocker API.
     """
     domain = _get_indeed_domain(location or "")
     country, city = _get_indeed_geo(location or "", domain)
@@ -635,15 +650,17 @@ def scrape_indeed(query: str, location: str = "", max_pages: int = 3) -> list[di
         return jobs
 
     try:
-        jobs = _paginated_scrape_browser(
+        jobs = _paginated_scrape_unlocker(
             warmup_url=warmup_url,
             url_fn=url_fn,
             parse_fn=parse_fn,
             location=location,
             max_pages=max_pages,
+            country=country,  # optional geo hint to Unlocker
         )
         logger.info(f"Total jobs scraped: {len(jobs)}")
         return jobs
     except Exception:
         logger.exception("scrape_indeed failed")
         return []
+    

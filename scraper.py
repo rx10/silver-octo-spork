@@ -47,21 +47,40 @@ def _unlocker_get_html(url: str, country: str | None = None) -> str:
     payload: dict = {
         "zone": UNLOCKER_ZONE_NAME,
         "url": url,
-        "format": "raw",  # raw response from target site
+        "format": "raw",
     }
-
-    # Optional: geo-targeting if you want to align with your _get_indeed_geo
     if country:
         payload["country"] = country.lower()
 
     resp = requests.post(UNLOCKER_ENDPOINT, json=payload, headers=headers, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
 
-    # Unlocker returns JSON with "body" containing the HTML
+    # Log non-2xx responses with body
+    if not resp.ok:
+        logger.error(
+            "Unlocker HTTP error %s for %s: %r",
+            resp.status_code,
+            url,
+            resp.text[:500],
+        )
+        resp.raise_for_status()
+
+    # Try to parse JSON, but log raw text if it fails
+    try:
+        data = resp.json()
+    except Exception as e:
+        logger.error(
+            "Unlocker returned non-JSON for %s: %s; body prefix=%r",
+            url,
+            e,
+            resp.text[:500],
+        )
+        raise
+
     body = data.get("body")
     if body is None:
+        logger.error("Unlocker JSON missing 'body' for %s: %r", url, data)
         raise RuntimeError(f"Unlocker response missing 'body' for {url}")
+
     return body
 
 MAX_RETRIES = 3

@@ -774,7 +774,7 @@ def _parse_indeed_page(
 def _indeed_via_oxylabs(
     query: str, location: str, domain: str,
     country: Optional[str], city: Optional[str],
-    max_pages: int = 5,
+    max_pages: int = 10,
 ) -> tuple[List[Dict], bool]:
     """
     PRIMARY: Oxylabs residential + curl_cffi (cookies persist = pagination).
@@ -790,7 +790,8 @@ def _indeed_via_oxylabs(
         warmup_url=f"https://{domain}/",
         url_fn=lambda pg: (
             f"https://{domain}/jobs"
-            f"?q={quote_plus(query)}&l={quote_plus(location)}&start={pg * 10}"
+            f"?q={quote_plus(query)}&l={quote_plus(location)}"
+            f"&start={pg * 50}&limit=50&filter=0&sort=date"
         ),
         parse_fn=lambda soup, loc: _parse_indeed_page(soup, loc, domain),
         location=location,
@@ -811,12 +812,14 @@ def _indeed_via_oxylabs(
 def _indeed_via_unlocker(
     query: str, location: str, domain: str,
     country: Optional[str],
-    max_variants: int = 10, max_jobs: int = 150,
+    max_variants: int = 10, max_jobs: int = 500,
+    max_pages_per_variant: int = 3,
     existing_urls: Optional[set] = None,
 ) -> List[Dict]:
     """
-    FALLBACK: Bright Data Web Unlocker + multi-query (no pagination).
-    Fires multiple query variants, deduplicates across all.
+    FALLBACK: Bright Data Web Unlocker + multi-query with pagination.
+    Fires multiple query variants, paginates each up to max_pages_per_variant,
+    deduplicates across all.
     """
     if not _unlocker_available():
         logger.warning("Indeed FALLBACK: Unlocker not configured, skipping")
@@ -832,36 +835,52 @@ def _indeed_via_unlocker(
     consecutive_failures = 0
 
     for i, q in enumerate(variants):
-        url = f"https://{domain}/jobs?q={quote_plus(q)}&l={quote_plus(location)}&start=0"
         logger.info(f"Indeed FALLBACK [{i+1}/{len(variants)}] query='{q}'")
 
-        if i > 0:
-            wait = random.uniform(8, 15)
-            logger.info(f"Indeed FALLBACK: waiting {wait:.1f}s")
-            time.sleep(wait)
+        for page in range(max_pages_per_variant):
+            start = page * 50
+            url = (
+                f"https://{domain}/jobs?q={quote_plus(q)}&l={quote_plus(location)}"
+                f"&start={start}&limit=50&filter=0&sort=date"
+            )
+            logger.info(f"Indeed FALLBACK '{q}' page {page+1} (start={start})")
 
-        try:
-            html = _unlocker_get_html(url, country=country)
-            consecutive_failures = 0
-        except Exception as e:
-            logger.warning(f"Indeed FALLBACK query '{q}' failed: {e}")
-            consecutive_failures += 1
-            if consecutive_failures >= 3:
-                logger.error("Indeed FALLBACK: 3 consecutive failures, stopping")
+            if i > 0 or page > 0:
+                wait = random.uniform(8, 15)
+                logger.info(f"Indeed FALLBACK: waiting {wait:.1f}s")
+                time.sleep(wait)
+
+            try:
+                html = _unlocker_get_html(url, country=country)
+                consecutive_failures = 0
+            except Exception as e:
+                logger.warning(f"Indeed FALLBACK query '{q}' page {page+1} failed: {e}")
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    logger.error("Indeed FALLBACK: 3 consecutive failures, stopping")
+                    break
+                continue
+
+            soup = BeautifulSoup(html, "html.parser")
+            page_jobs = _parse_indeed_page(soup, fallback_location=location, domain=domain)
+
+            new_jobs = [j for j in page_jobs if j["url"] not in seen_urls]
+            seen_urls.update(j["url"] for j in new_jobs)
+            all_jobs.extend(new_jobs)
+
+            logger.info(f"Indeed FALLBACK '{q}' page {page+1}: {len(page_jobs)} parsed, {len(new_jobs)} new (total: {len(all_jobs)})")
+
+            # Stop paginating this variant if no new jobs on this page
+            if len(new_jobs) == 0:
+                logger.info(f"Indeed FALLBACK '{q}': no new jobs on page {page+1}, moving to next variant")
                 break
-            continue
 
-        soup = BeautifulSoup(html, "html.parser")
-        page_jobs = _parse_indeed_page(soup, fallback_location=location, domain=domain)
+            if len(all_jobs) >= max_jobs:
+                break
 
-        new_jobs = [j for j in page_jobs if j["url"] not in seen_urls]
-        seen_urls.update(j["url"] for j in new_jobs)
-        all_jobs.extend(new_jobs)
-
-        logger.info(f"Indeed FALLBACK '{q}': {len(page_jobs)} parsed, {len(new_jobs)} new (total: {len(all_jobs)})")
-
-        if len(all_jobs) >= max_jobs:
-            logger.info(f"Indeed FALLBACK: reached {max_jobs}+ jobs, stopping")
+        if consecutive_failures >= 3 or len(all_jobs) >= max_jobs:
+            if len(all_jobs) >= max_jobs:
+                logger.info(f"Indeed FALLBACK: reached {max_jobs}+ jobs, stopping")
             break
 
     return all_jobs
@@ -870,9 +889,9 @@ def _indeed_via_unlocker(
 def scrape_indeed(
     query: str,
     location: str = "",
-    max_pages: int = 5,
+    max_pages: int = 10,
     max_variants: int = 10,
-    max_jobs: int = 150,
+    max_jobs: int = 500,
 ) -> List[Dict]:
     """
     Layered Indeed scraper:

@@ -3,10 +3,10 @@ Job scraper — Dice, LinkedIn, Indeed, ZipRecruiter, RemoteOK, Glassdoor.
 
 Dice:         Playwright intercepts x-api-key once → httpx API calls
 LinkedIn:     curl_cffi (Chrome TLS fingerprint) + Oxylabs sticky sessions
-Indeed:       curl_cffi + Oxylabs residential geo-targeting → HTML parse
-ZipRecruiter: curl_cffi + proxy → HTML parse
+Indeed:       Bright Data Web Unlocker API + multi-query strategy
+ZipRecruiter: curl_cffi + Oxylabs proxy → HTML parse
 RemoteOK:     Public JSON API (no proxy needed)
-Glassdoor:    curl_cffi + proxy → HTML parse
+Glassdoor:    curl_cffi + Oxylabs proxy → HTML parse
 """
 
 import re, os, hashlib, random, string, time, logging, json
@@ -15,9 +15,15 @@ from typing import Optional, List, Dict
 from urllib.parse import quote_plus, quote, urlparse
 
 import httpx
+import requests
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
+
+# Bright Data Unlocker (for Indeed)
+BRIGHTDATA_API_KEY = os.environ.get("BRIGHTDATA_API_KEY")
+UNLOCKER_ZONE_NAME = os.environ.get("UNLOCKER_ZONE_NAME")
+UNLOCKER_ENDPOINT = "https://api.brightdata.com/request"
 
 MAX_RETRIES = 3
 
@@ -29,6 +35,151 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
 ]
+
+# ═══════════════════════════════════════════════════════════════════════
+#  INDEED — multi-query definitions per role category
+# ═══════════════════════════════════════════════════════════════════════
+
+# Each base role maps to a set of query variants to maximize coverage
+# since Unlocker can't paginate (no cookie persistence).
+INDEED_QUERY_VARIANTS = {
+    # Software / Development roles
+    "software": [
+        "software developer",
+        "software engineer",
+        "full stack developer",
+        "backend developer",
+        "frontend developer",
+        "web developer",
+        "junior software developer",
+        "senior software developer",
+        "SDE",
+        "application developer",
+    ],
+    "java": [
+        "java developer",
+        "java engineer",
+        "java full stack developer",
+        "spring boot developer",
+        "java backend developer",
+        "senior java developer",
+        "java microservices",
+    ],
+    "python": [
+        "python developer",
+        "python engineer",
+        "python backend developer",
+        "django developer",
+        "flask developer",
+        "python automation",
+        "senior python developer",
+    ],
+    "javascript": [
+        "javascript developer",
+        "react developer",
+        "node.js developer",
+        "angular developer",
+        "vue.js developer",
+        "typescript developer",
+        "frontend engineer",
+        "next.js developer",
+    ],
+    "devops": [
+        "devops engineer",
+        "cloud engineer",
+        "site reliability engineer",
+        "SRE",
+        "platform engineer",
+        "AWS engineer",
+        "kubernetes engineer",
+        "infrastructure engineer",
+        "CI/CD engineer",
+    ],
+    "data": [
+        "data engineer",
+        "data scientist",
+        "data analyst",
+        "machine learning engineer",
+        "ML engineer",
+        "AI engineer",
+        "big data engineer",
+        "ETL developer",
+        "analytics engineer",
+    ],
+    "qa": [
+        "QA engineer",
+        "test engineer",
+        "SDET",
+        "automation tester",
+        "quality assurance",
+        "selenium tester",
+        "performance tester",
+        "QA analyst",
+    ],
+    "mobile": [
+        "android developer",
+        "iOS developer",
+        "mobile developer",
+        "react native developer",
+        "flutter developer",
+        "mobile engineer",
+        "kotlin developer",
+        "swift developer",
+    ],
+    "database": [
+        "database administrator",
+        "DBA",
+        "SQL developer",
+        "database developer",
+        "PostgreSQL",
+        "MongoDB developer",
+        "data architect",
+    ],
+    "security": [
+        "security engineer",
+        "cybersecurity",
+        "information security",
+        "SOC analyst",
+        "penetration tester",
+        "security analyst",
+    ],
+}
+
+
+def _get_query_variants(base_query: str, max_variants: int = 10) -> List[str]:
+    """
+    Given a base search query, return a list of variant queries.
+    Looks for keyword matches in INDEED_QUERY_VARIANTS, otherwise
+    generates simple variants from the base query.
+    """
+    base_lower = base_query.lower().strip()
+    variants = [base_query]  # always include original
+
+    # Check each category for keyword match
+    for category, category_variants in INDEED_QUERY_VARIANTS.items():
+        if category in base_lower or any(
+            v.lower() in base_lower or base_lower in v.lower()
+            for v in category_variants[:3]
+        ):
+            for v in category_variants:
+                if v.lower() != base_lower and v not in variants:
+                    variants.append(v)
+            break
+
+    # If no category matched, generate basic variants
+    if len(variants) == 1:
+        suffixes = ["junior", "senior", "lead", "intern", "associate"]
+        for s in suffixes:
+            if s not in base_lower:
+                variants.append(f"{s} {base_query}")
+        # Also try related terms
+        if "developer" in base_lower:
+            variants.append(base_query.replace("developer", "engineer"))
+        elif "engineer" in base_lower:
+            variants.append(base_query.replace("engineer", "developer"))
+
+    return variants[:max_variants]
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  UTILITIES
@@ -83,6 +234,87 @@ def parse_date(s: Optional[str]) -> Optional[str]:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).date().isoformat()
     except ValueError:
         return today.isoformat()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  BRIGHT DATA WEB UNLOCKER — for Indeed only
+# ═══════════════════════════════════════════════════════════════════════
+
+def _unlocker_get_html(url: str, country: str | None = None, retries: int = 3) -> str:
+    """
+    Fetch a URL via Bright Data Web Unlocker API.
+    Retries with increasing backoff on empty body or CAPTCHA.
+    """
+    if not BRIGHTDATA_API_KEY:
+        raise RuntimeError("Missing BRIGHTDATA_API_KEY env var")
+    if not UNLOCKER_ZONE_NAME:
+        raise RuntimeError("Missing UNLOCKER_ZONE_NAME env var")
+
+    headers = {
+        "Authorization": f"Bearer {BRIGHTDATA_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload: dict = {
+        "zone": UNLOCKER_ZONE_NAME,
+        "url": url,
+        "format": "raw",
+    }
+    if country:
+        payload["country"] = country.lower()
+
+    last_err = None
+    last_body = "(no response yet)"
+
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.post(
+                UNLOCKER_ENDPOINT,
+                json=payload,
+                headers=headers,
+                timeout=120,
+            )
+
+            if not resp.ok:
+                last_body = resp.text[:500]
+                logger.error(
+                    "Unlocker HTTP %s for %s (attempt %d/%d): %r",
+                    resp.status_code, url, attempt, retries, last_body,
+                )
+                resp.raise_for_status()
+
+            html = resp.text
+            last_body = html[:500] if html else "(empty)"
+
+            if not html.strip():
+                raise RuntimeError("Unlocker returned empty body")
+
+            # Detect CAPTCHA/block pages
+            if len(html) < 2000 and ("captcha" in html.lower() or "unusual traffic" in html.lower()):
+                logger.warning(
+                    "Unlocker CAPTCHA/block for %s (attempt %d/%d)",
+                    url, attempt, retries,
+                )
+                raise RuntimeError("Unlocker returned CAPTCHA page")
+
+            return html
+
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                "Unlocker failed for %s (attempt %d/%d): %s",
+                url, attempt, retries, e,
+            )
+            if attempt < retries:
+                wait = 3 * (2 ** (attempt - 1)) + random.uniform(0, 2)
+                logger.info(f"Retrying in {wait:.1f}s...")
+                time.sleep(wait)
+
+    logger.error(
+        "Unlocker exhausted %d attempts for %s, last body=%r",
+        retries, url, last_body,
+    )
+    raise RuntimeError(f"Unlocker failed after {retries} attempts for {url}") from last_err
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -186,7 +418,6 @@ INDEED_COUNTRY_MAP = {
     ],
 }
 
-# Oxylabs geo-targeting: -cc-XX for country, -city-xxx for city
 INDEED_GEO_MAP = {
     "in.indeed.com": ("IN", {
         "hyderabad": "hyderabad", "secunderabad": "hyderabad",
@@ -229,60 +460,25 @@ INDEED_GEO_MAP = {
         "birmingham": "birmingham", "leeds": "leeds",
         "glasgow": "glasgow", "edinburgh": "edinburgh",
         "liverpool": "liverpool", "bristol": "bristol",
-        "sheffield": "sheffield", "cardiff": "cardiff",
-        "belfast": "belfast", "nottingham": "nottingham",
-        "newcastle": "newcastle", "southampton": "southampton",
-        "cambridge": "cambridge", "oxford": "oxford",
-        "brighton": "brighton", "leicester": "leicester",
     }),
     "de.indeed.com": ("DE", {
-        "berlin": "berlin", "munich": "munich", "münchen": "munich",
+        "berlin": "berlin", "munich": "munich",
         "hamburg": "hamburg", "frankfurt": "frankfurt",
-        "cologne": "cologne", "köln": "cologne",
-        "düsseldorf": "dusseldorf", "stuttgart": "stuttgart",
-        "leipzig": "leipzig", "dresden": "dresden",
-        "hannover": "hannover", "nuremberg": "nuremberg",
     }),
     "ca.indeed.com": ("CA", {
         "toronto": "toronto", "vancouver": "vancouver",
-        "montreal": "montreal", "montréal": "montreal",
-        "calgary": "calgary", "edmonton": "edmonton",
-        "ottawa": "ottawa", "winnipeg": "winnipeg",
-        "quebec": "quebec", "hamilton": "hamilton",
-        "halifax": "halifax",
+        "montreal": "montreal", "calgary": "calgary",
     }),
     "au.indeed.com": ("AU", {
         "sydney": "sydney", "melbourne": "melbourne",
         "brisbane": "brisbane", "perth": "perth",
-        "adelaide": "adelaide", "gold coast": "gold_coast",
-        "canberra": "canberra", "hobart": "hobart",
-        "darwin": "darwin",
     }),
     "sg.indeed.com": ("SG", {"singapore": "singapore"}),
-    "jp.indeed.com": ("JP", {
-        "tokyo": "tokyo", "osaka": "osaka",
-        "kyoto": "kyoto", "yokohama": "yokohama",
-        "nagoya": "nagoya", "fukuoka": "fukuoka",
-    }),
-    "ae.indeed.com": ("AE", {
-        "dubai": "dubai", "abu dhabi": "abu_dhabi",
-        "sharjah": "sharjah",
-    }),
-    "nl.indeed.com": ("NL", {
-        "amsterdam": "amsterdam", "rotterdam": "rotterdam",
-        "the hague": "the_hague", "den haag": "the_hague",
-        "utrecht": "utrecht", "eindhoven": "eindhoven",
-    }),
-    "fr.indeed.com": ("FR", {
-        "paris": "paris", "lyon": "lyon",
-        "marseille": "marseille", "toulouse": "toulouse",
-        "nice": "nice", "bordeaux": "bordeaux",
-        "lille": "lille", "strasbourg": "strasbourg",
-    }),
-    "ie.indeed.com": ("IE", {
-        "dublin": "dublin", "cork": "cork",
-        "galway": "galway", "limerick": "limerick",
-    }),
+    "jp.indeed.com": ("JP", {"tokyo": "tokyo", "osaka": "osaka"}),
+    "ae.indeed.com": ("AE", {"dubai": "dubai", "abu dhabi": "abu_dhabi"}),
+    "nl.indeed.com": ("NL", {"amsterdam": "amsterdam", "rotterdam": "rotterdam"}),
+    "fr.indeed.com": ("FR", {"paris": "paris", "lyon": "lyon"}),
+    "ie.indeed.com": ("IE", {"dublin": "dublin", "cork": "cork"}),
 }
 
 
@@ -309,7 +505,7 @@ def _get_indeed_geo(location: str, domain: str) -> tuple[Optional[str], Optional
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  PROXY — Oxylabs residential sticky sessions + geo-targeting
+#  PROXY — Oxylabs residential (for LinkedIn, ZipRecruiter, Glassdoor)
 # ═══════════════════════════════════════════════════════════════════════
 
 class ProxyConfig:
@@ -350,10 +546,6 @@ class ProxyConfig:
         country: Optional[str] = None,
         city: Optional[str] = None,
     ) -> Optional[str]:
-        """
-        Build Oxylabs proxy URL with optional geo-targeting.
-        Appends -cc-XX for country and -city-xxx for city to the username.
-        """
         self._load()
         if not self.user or not self.password:
             return None
@@ -396,7 +588,6 @@ def _make_session(
     country: Optional[str] = None,
     city: Optional[str] = None,
 ):
-    """Return (session, is_curl). Supports Oxylabs geo-targeting."""
     proxy = _proxy.url(sticky_session=sid, country=country, city=city)
     if _check_curl():
         from curl_cffi import requests as curl_requests
@@ -409,7 +600,7 @@ def _make_session(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  GENERIC PAGINATED SCRAPER
+#  GENERIC PAGINATED SCRAPER (for non-Indeed sources)
 # ═══════════════════════════════════════════════════════════════════════
 
 def _paginated_scrape(
@@ -426,14 +617,11 @@ def _paginated_scrape(
     country: Optional[str] = None,
     city: Optional[str] = None,
 ) -> list[dict]:
-    """Shared loop: session → warmup → paginate → parse → rotate on block.
-    curl_cffi maintains cookies across requests so pagination works."""
     sid = _new_sid()
     session, _ = _make_session(sid, country=country, city=city)
     jobs: list[dict] = []
     rotations_left = max_rotations
 
-    # Warmup — loads cookies
     try:
         session.get(warmup_url, headers=hdr(), timeout=15)
         delay(2, 4)
@@ -667,7 +855,7 @@ def scrape_linkedin(role: str, location: str, max_pages=3, max_details=15) -> li
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  INDEED — curl_cffi + Oxylabs residential geo-targeting + cookies
+#  INDEED — Bright Data Unlocker + multi-query strategy
 # ═══════════════════════════════════════════════════════════════════════
 
 def _parse_indeed_page(
@@ -764,39 +952,71 @@ def _parse_indeed_page(
     return jobs
 
 
-def scrape_indeed(query: str, location: str = "", max_pages: int = 5) -> List[Dict]:
+def scrape_indeed(
+    query: str,
+    location: str = "",
+    max_pages: int = 5,
+    max_variants: int = 10,
+    max_jobs: int = 150,
+) -> List[Dict]:
     """
-    Indeed scraper: curl_cffi session (cookies persist across pages)
-    + Oxylabs residential proxy with geo-targeting.
+    Indeed scraper using Bright Data Web Unlocker API.
+    Can't paginate (no cookie persistence), so fires multiple
+    query variants to maximize job coverage via deduplication.
     """
     domain = _get_indeed_domain(location or "")
     country, city = _get_indeed_geo(location or "", domain)
     logger.info(f"Indeed: domain={domain}, geo=({country}, {city}) for '{location}'")
 
-    jobs = _paginated_scrape(
-        warmup_url=f"https://{domain}/",
-        url_fn=lambda pg: (
-            f"https://{domain}/jobs"
-            f"?q={quote_plus(query)}&l={quote_plus(location)}&start={pg * 10}"
-        ),
-        parse_fn=lambda soup, loc: _parse_indeed_page(soup, loc, domain),
-        location=location,
-        max_pages=max_pages,
-        delay_range=(4, 8),
-        country=country,
-        city=city,
-    )
+    # Build query variants
+    variants = _get_query_variants(query, max_variants=max_variants)
+    logger.info(f"Indeed: {len(variants)} query variants for '{query}': {variants}")
 
-    # Deduplicate
-    seen: set = set()
-    unique: list = []
-    for j in jobs:
-        if j["url"] not in seen:
-            seen.add(j["url"])
-            unique.append(j)
+    all_jobs: List[Dict] = []
+    seen_urls: set = set()
+    consecutive_failures = 0
 
-    logger.info(f"Indeed total: {len(unique)} unique jobs (domain: {domain})")
-    return unique
+    for i, q in enumerate(variants):
+        url = f"https://{domain}/jobs?q={quote_plus(q)}&l={quote_plus(location)}&start=0"
+        logger.info(f"Indeed [{i+1}/{len(variants)}] query='{q}'")
+
+        # Delay between queries (not before first)
+        if i > 0:
+            wait = random.uniform(8, 15)
+            logger.info(f"Indeed: waiting {wait:.1f}s before next query")
+            time.sleep(wait)
+
+        try:
+            html = _unlocker_get_html(url, country=country)
+            consecutive_failures = 0
+        except Exception as e:
+            logger.warning(f"Indeed query '{q}' failed: {e}")
+            consecutive_failures += 1
+            if consecutive_failures >= 3:
+                logger.error("Indeed: 3 consecutive failures, stopping")
+                break
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+        page_jobs = _parse_indeed_page(soup, fallback_location=location, domain=domain)
+
+        # Deduplicate across queries
+        new_jobs = [j for j in page_jobs if j["url"] not in seen_urls]
+        seen_urls.update(j["url"] for j in new_jobs)
+        all_jobs.extend(new_jobs)
+
+        logger.info(
+            f"Indeed '{q}': {len(page_jobs)} parsed, {len(new_jobs)} new "
+            f"(total: {len(all_jobs)})"
+        )
+
+        # Stop if we have enough
+        if len(all_jobs) >= max_jobs:
+            logger.info(f"Indeed: reached {max_jobs}+ jobs, stopping")
+            break
+
+    logger.info(f"Indeed total: {len(all_jobs)} unique jobs (domain: {domain})")
+    return all_jobs
 
 
 # ═══════════════════════════════════════════════════════════════════════

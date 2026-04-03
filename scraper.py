@@ -562,11 +562,27 @@ def _get_dice_key() -> str:
                 if k and len(k) >= 30: key = k
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
-            page = browser.new_page(user_agent=random.choice(USER_AGENTS))
+            ctx = browser.new_context(
+                user_agent=random.choice(USER_AGENTS),
+                locale="en-US",
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            )
+            page = ctx.new_page()
             page.on("request", on_req)
+            # dismiss consent walls before the search fires
             page.goto("https://www.dice.com/jobs?q=developer&location=United+States",
-                       wait_until="networkidle", timeout=45000)
-            page.wait_for_timeout(6000)
+                       wait_until="domcontentloaded", timeout=45000)
+            for selector in [
+                "button[id*='accept']", "button[id*='agree']",
+                "button[class*='accept']", "button[class*='agree']",
+                "[aria-label*='Accept']", "[aria-label*='agree']",
+            ]:
+                try:
+                    page.locator(selector).first.click(timeout=2000)
+                    break
+                except Exception:
+                    pass
+            page.wait_for_timeout(8000)
             browser.close()
         if key:
             _cached_dice_key = key

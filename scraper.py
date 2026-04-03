@@ -916,6 +916,31 @@ def scrape_indeed(
 
 def _parse_ziprecruiter(soup: BeautifulSoup, fallback_loc: str) -> list[dict]:
     jobs = []
+
+    # New US format: article[id^="job-card-"]
+    new_cards = soup.select("article[id^='job-card-']")
+    for card in new_cards:
+        token = card.get("id", "").replace("job-card-", "")
+        if not token: continue
+        href = f"https://www.ziprecruiter.com/ojob/{token}"
+        btn = card.find("button", attrs={"aria-label": lambda x: x and x.startswith("View ")})
+        title = btn["aria-label"][5:] if btn else (card.find("h2") or card).get_text(strip=True)
+        company_el = card.find("a", attrs={"data-testid": "job-card-company"})
+        loc_el = card.find("a", attrs={"data-testid": "job-card-location"})
+        text = card.get_text(" ", strip=True)
+        salary_m = re.search(r"[\$£€₹][\d,\.]+[KkMm]?\s*[-–]\s*[\$£€₹]?[\d,\.]+[KkMm]?(?:/(?:yr|hr|mo))?", text)
+        salary = salary_m.group(0) if salary_m else None
+        jobs.append({
+            "id": make_id(href), "title": title,
+            "company": company_el.get_text(strip=True) if company_el else "Unknown",
+            "location": loc_el.get_text(strip=True) if loc_el else fallback_loc,
+            "posted_date": None, "description": None,
+            "salary": salary, "url": href, "source": "ZipRecruiter",
+        })
+    if jobs:
+        return jobs
+
+    # Legacy format: article.job_result / li[class*='job-listing']
     cards = soup.select("article.job_result, div.job_result_two_pane, li[class*='job-listing'], div[data-testid='job-card']")
     for card in cards:
         title_el = card.select_one("h2.title a, a[class*='job-link'], h2[class*='title'], a[data-testid='job-title']")

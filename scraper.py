@@ -956,54 +956,39 @@ def scrape_indeed(
 # ═══════════════════════════════════════════════════════════════════════
 
 def _parse_ziprecruiter(soup: BeautifulSoup, fallback_loc: str) -> list[dict]:
+    def _txt(el): return el.get_text(strip=True) if el else None
     jobs = []
 
-    # New US format: article[id^="job-card-"]
-    new_cards = soup.select("article[id^='job-card-']")
-    for card in new_cards:
-        token = card.get("id", "").replace("job-card-", "")
-        if not token: continue
-        href = f"https://www.ziprecruiter.com/ojob/{token}"
+    # New US format (React/Tailwind)
+    for card in soup.select("article[id^='job-card-']"):
+        token = card["id"].replace("job-card-", "")
         btn = card.find("button", attrs={"aria-label": lambda x: x and x.startswith("View ")})
-        title = btn["aria-label"][5:] if btn else (card.find("h2") or card).get_text(strip=True)
-        company_el = card.find("a", attrs={"data-testid": "job-card-company"})
-        loc_el = card.find("a", attrs={"data-testid": "job-card-location"})
-        text = card.get_text(" ", strip=True)
-        salary_m = re.search(r"[$£€₹][\d,\.]+[KkMm]?\s*[-\u2013]\s*[$£€₹]?[\d,\.]+[KkMm]?(?:/(?:yr|hr|mo))?", text)
-        salary = salary_m.group(0) if salary_m else None
+        sal = re.search(r"[$£€₹][\d,.]+[KkMm]?\s*[-\u2013]\s*[$£€₹]?[\d,.]+[KkMm]?(?:/(?:yr|hr|mo))?", card.get_text(" "))
+        url = f"https://www.ziprecruiter.com/ojob/{token}"
         jobs.append({
-            "id": make_id(href), "title": title,
-            "company": company_el.get_text(strip=True) if company_el else "Unknown",
-            "location": loc_el.get_text(strip=True) if loc_el else fallback_loc,
+            "id": make_id(url), "title": btn["aria-label"][5:] if btn else _txt(card.find("h2")) or "",
+            "company": _txt(card.find("a", {"data-testid": "job-card-company"})) or "Unknown",
+            "location": _txt(card.find("a", {"data-testid": "job-card-location"})) or fallback_loc,
             "posted_date": None, "description": None,
-            "salary": salary, "url": href, "source": "ZipRecruiter",
+            "salary": sal.group(0) if sal else None, "url": url, "source": "ZipRecruiter",
         })
-    if jobs:
-        return jobs
+    if jobs: return jobs
 
-    # Legacy format: article.job_result / li[class*='job-listing']
-    cards = soup.select("article.job_result, div.job_result_two_pane, li[class*='job-listing'], div[data-testid='job-card']")
-    for card in cards:
-        title_el = card.select_one("h2.title a, a[class*='job-link'], h2[class*='title'], a[data-testid='job-title']")
-        if not title_el: continue
-        href = title_el.get("href", "")
-        if href.startswith("/"): href = f"https://www.ziprecruiter.com{href}"
+    # Legacy format (IE/international)
+    for card in soup.select("article.job_result, div.job_result_two_pane, li[class*='job-listing']"):
+        a = card.select_one("h2.title a, a[class*='job-link'], a[data-testid='job-title']")
+        if not a: continue
+        href = a["href"] if a["href"].startswith("http") else f"https://www.ziprecruiter.com{a['href']}"
         if not href.startswith("http"): continue
-        company_el = card.select_one("a.t_org_link, span[class*='company'], p[class*='company'], a[data-testid='company-name']")
-        loc_el = card.select_one("p.location, span[class*='location'], div[class*='location'], span[data-testid='location']")
-        salary_el = card.select_one("span[class*='salary'], div[class*='salary'], p[class*='salary']")
-        date_el = card.select_one("div[class*='date'], span[class*='date'], time")
-        snippet_el = card.select_one("p[class*='snippet'], div[class*='snippet'], ul[class*='bullets']")
-        salary = salary_el.get_text(strip=True) if salary_el else None
-        if salary and not re.search(r"[\d$£€₹]", salary): salary = None
+        sal = _txt(card.select_one("span[class*='salary'], div[class*='salary']"))
         jobs.append({
-            "id": make_id(href),
-            "title": title_el.get_text(strip=True),
-            "company": company_el.get_text(strip=True) if company_el else "Unknown",
-            "location": loc_el.get_text(strip=True) if loc_el else fallback_loc,
-            "posted_date": parse_date(date_el.get_text(strip=True)) if date_el else None,
-            "description": trunc(snippet_el.get_text(separator=" ", strip=True)) if snippet_el else None,
-            "salary": salary, "url": href, "source": "ZipRecruiter",
+            "id": make_id(href), "title": _txt(a),
+            "company": _txt(card.select_one("a.t_org_link, a[data-testid='company-name']")) or "Unknown",
+            "location": _txt(card.select_one("p.location, span[data-testid='location']")) or fallback_loc,
+            "posted_date": parse_date(_txt(card.select_one("div[class*='date'], time"))),
+            "description": trunc(_txt(card.select_one("p[class*='snippet'], ul[class*='bullets']"))),
+            "salary": sal if sal and re.search(r"[\d$£€₹]", sal) else None,
+            "url": href, "source": "ZipRecruiter",
         })
     return jobs
 

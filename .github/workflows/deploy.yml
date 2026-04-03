@@ -23,6 +23,7 @@ jobs:
             git remote set-url origin https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/socratic-pro/silver-octo-spork.git
             git fetch origin master
             git reset --hard origin/master
+            git remote set-url origin https://github.com/socratic-pro/silver-octo-spork.git
 
             .venv/bin/pip install -r requirements.txt --quiet
 

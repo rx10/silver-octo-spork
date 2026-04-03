@@ -36,7 +36,7 @@ class TestEnvVarFallback(unittest.TestCase):
             raise RuntimeError("playwright not installed")
 
         with patch.dict(os.environ, {"DICE_API_KEY": fake_key}):
-            with patch("scraper.sync_playwright", side_effect=boom):
+            with patch("playwright.sync_api.sync_playwright", side_effect=boom):
                 key = scraper._get_dice_key()
 
         self.assertEqual(key, fake_key)
@@ -50,7 +50,7 @@ class TestEnvVarFallback(unittest.TestCase):
             raise RuntimeError("playwright not installed")
 
         with patch.dict(os.environ, {"DICE_API_KEY": fake_key}):
-            with patch("scraper.sync_playwright", side_effect=boom):
+            with patch("playwright.sync_api.sync_playwright", side_effect=boom):
                 k1 = scraper._get_dice_key()
                 k2 = scraper._get_dice_key()   # should use cache, not call playwright again
 
@@ -73,7 +73,7 @@ class TestRuntimeErrorPath(unittest.TestCase):
         def boom(*a, **kw):
             raise RuntimeError("playwright not installed")
 
-        with patch("scraper.sync_playwright", side_effect=boom):
+        with patch("playwright.sync_api.sync_playwright", side_effect=boom):
             with patch.dict(os.environ, env, clear=True):
                 with self.assertRaises(RuntimeError) as ctx:
                     scraper._get_dice_key()
@@ -136,7 +136,7 @@ class TestPlaywrightInterception(unittest.TestCase):
 
         mock_sync_pw = self._make_playwright_mock(intercepted_key=fake_key)
 
-        with patch("scraper.sync_playwright", mock_sync_pw):
+        with patch("playwright.sync_api.sync_playwright", mock_sync_pw):
             with patch.dict(os.environ, {}, clear=False):
                 os.environ.pop("DICE_API_KEY", None)
                 key = scraper._get_dice_key()
@@ -151,7 +151,7 @@ class TestPlaywrightInterception(unittest.TestCase):
 
         mock_sync_pw = self._make_playwright_mock(intercepted_key=short_key)
 
-        with patch("scraper.sync_playwright", mock_sync_pw):
+        with patch("playwright.sync_api.sync_playwright", mock_sync_pw):
             with patch.dict(os.environ, {"DICE_API_KEY": env_key}):
                 key = scraper._get_dice_key()
 

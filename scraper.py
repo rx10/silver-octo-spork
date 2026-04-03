@@ -573,9 +573,11 @@ def _get_dice_key() -> str:
             page.goto("https://www.dice.com/jobs?q=developer&location=United+States",
                        wait_until="domcontentloaded", timeout=45000)
             for selector in [
-                "button[id*='accept']", "button[id*='agree']",
-                "button[class*='accept']", "button[class*='agree']",
-                "[aria-label*='Accept']", "[aria-label*='agree']",
+                "button:has-text('Allow all')",
+                "button:has-text('Accept all')",
+                "button:has-text('Allow All')",
+                "button[id*='accept']",
+                "button[class*='accept']",
             ]:
                 try:
                     page.locator(selector).first.click(timeout=2000)

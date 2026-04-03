@@ -287,7 +287,8 @@ INDEED_COUNTRY_MAP = {
         "edinburgh", "liverpool", "bristol", "sheffield", "cardiff",
         "belfast", "nottingham", "newcastle", "southampton",
         "cambridge", "oxford", "reading", "brighton", "leicester",
-        "coventry", "aberdeen", "dundee", "swansea", "york",
+        "coventry", "aberdeen", "dundee", "swansea",
+        "york, uk", "york, england",   # avoid matching "New York" → use qualified form
         "england", "scotland", "wales", "northern ireland",
         "united kingdom", "uk", "britain", "great britain",
     ],
@@ -351,8 +352,10 @@ INDEED_GEO_MAP = {
 
 def _get_indeed_domain(location: str) -> str:
     loc = location.lower().strip()
+    import re as _re
     for domain, keywords in INDEED_COUNTRY_MAP.items():
-        if any(kw in loc for kw in keywords):
+        # Use word-boundary matching to avoid "york" matching "new york" → uk
+        if any(_re.search(r'\b' + _re.escape(kw) + r'\b', loc) for kw in keywords):
             return domain
     return "www.indeed.com"
 
@@ -743,10 +746,30 @@ def _parse_indeed_page(
     return jobs
 
 
+def _parse_indeed_page_with_next(
+    soup: BeautifulSoup,
+    fallback_location: str,
+    domain: str = "in.indeed.com",
+) -> tuple[List[Dict], bool]:
+    """Like _parse_indeed_page but also returns has_next bool."""
+    jobs = _parse_indeed_page(soup, fallback_location, domain)
+
+    # Check for next-page signals
+    has_next = bool(
+        soup.select_one('div[data-testid="pagination-page-next"]') or
+        soup.select_one('[aria-label="Next Page"]') or
+        soup.select_one('a[aria-label="Next"]') or
+        soup.select_one('nav.icl-Pagination a[aria-label*="ext"]') or
+        soup.select_one('a.pagination-page[aria-label*="ext"]')
+    )
+
+    return jobs, has_next
+
+
 def _indeed_via_oxylabs(
     query: str, location: str, domain: str,
     country: Optional[str], city: Optional[str],
-    max_pages: int = 10,
+    max_pages: int = 20,
 ) -> tuple[List[Dict], bool]:
     """
     PRIMARY: Oxylabs residential + curl_cffi (cookies persist = pagination).
@@ -784,7 +807,7 @@ def _indeed_via_oxylabs(
 def _indeed_via_unlocker(
     query: str, location: str, domain: str,
     country: Optional[str],
-    max_pages: int = 10, max_jobs: int = 500,
+    max_pages: int = 30, max_jobs: int = 1000,
     existing_urls: Optional[set] = None,
 ) -> List[Dict]:
     """
@@ -800,6 +823,7 @@ def _indeed_via_unlocker(
     all_jobs: List[Dict] = []
     seen_urls: set = existing_urls.copy() if existing_urls else set()
     consecutive_failures = 0
+    consecutive_empty = 0
 
     for page in range(max_pages):
         start = page * 50
@@ -826,16 +850,25 @@ def _indeed_via_unlocker(
             continue
 
         soup = BeautifulSoup(html, "html.parser")
-        page_jobs = _parse_indeed_page(soup, fallback_location=location, domain=domain)
+        page_jobs, has_next = _parse_indeed_page_with_next(soup, fallback_location=location, domain=domain)
 
         new_jobs = [j for j in page_jobs if j["url"] not in seen_urls]
         seen_urls.update(j["url"] for j in new_jobs)
         all_jobs.extend(new_jobs)
 
-        logger.info(f"Indeed FALLBACK page {page+1}: {len(page_jobs)} parsed, {len(new_jobs)} new (total: {len(all_jobs)})")
+        logger.info(f"Indeed FALLBACK page {page+1}: {len(page_jobs)} parsed, {len(new_jobs)} new (total: {len(all_jobs)}), has_next={has_next}")
 
         if len(new_jobs) == 0:
-            logger.info(f"Indeed FALLBACK: no new jobs on page {page+1}, stopping")
+            consecutive_empty += 1
+            logger.info(f"Indeed FALLBACK: no new jobs on page {page+1} (consecutive_empty={consecutive_empty})")
+            if consecutive_empty >= 2:
+                logger.info("Indeed FALLBACK: 2 consecutive empty pages, stopping")
+                break
+        else:
+            consecutive_empty = 0
+
+        if not has_next:
+            logger.info(f"Indeed FALLBACK: no next page signal on page {page+1}, stopping")
             break
 
         if len(all_jobs) >= max_jobs:
@@ -850,13 +883,21 @@ def scrape_indeed(
     location: str = "",
     max_pages: int = 10,
     max_jobs: int = 500,
+    deep: bool = False,
 ) -> List[Dict]:
     """
     Layered Indeed scraper:
     1. PRIMARY: Oxylabs residential + curl_cffi (paginated, cookies persist)
     2. FALLBACK: Bright Data Unlocker multi-query (if primary fails or returns few)
     3. Merge + deduplicate everything
+
+    Set deep=True for max coverage (max_pages=30, max_jobs=1500).
     """
+    if deep:
+        max_pages = 30
+        max_jobs = 1500
+        logger.info("Indeed: deep mode enabled (max_pages=30, max_jobs=1500)")
+
     domain = _get_indeed_domain(location or "")
     country, city = _get_indeed_geo(location or "", domain)
     logger.info(f"Indeed: domain={domain}, geo=({country}, {city}) for '{location}'")
@@ -903,9 +944,9 @@ def scrape_indeed(
     primary_count = len(primary_jobs)
     fallback_count = len(fallback_jobs)
     logger.info(
-        f"Indeed total: {len(unique)} unique jobs "
-        f"(primary: {primary_count}, fallback: {fallback_count}, "
-        f"domain: {domain})"
+        f"Indeed SUMMARY — total: {len(unique)} unique jobs | "
+        f"primary: {primary_count} | fallback: {fallback_count} | "
+        f"domain: {domain}"
     )
     return unique
 
@@ -928,7 +969,7 @@ def _parse_ziprecruiter(soup: BeautifulSoup, fallback_loc: str) -> list[dict]:
         company_el = card.find("a", attrs={"data-testid": "job-card-company"})
         loc_el = card.find("a", attrs={"data-testid": "job-card-location"})
         text = card.get_text(" ", strip=True)
-        salary_m = re.search(r"[\$£€₹][\d,\.]+[KkMm]?\s*[-–]\s*[\$£€₹]?[\d,\.]+[KkMm]?(?:/(?:yr|hr|mo))?", text)
+        salary_m = re.search(r"[$£€₹][\d,\.]+[KkMm]?\s*[-\u2013]\s*[$£€₹]?[\d,\.]+[KkMm]?(?:/(?:yr|hr|mo))?", text)
         salary = salary_m.group(0) if salary_m else None
         jobs.append({
             "id": make_id(href), "title": title,
@@ -965,7 +1006,6 @@ def _parse_ziprecruiter(soup: BeautifulSoup, fallback_loc: str) -> list[dict]:
             "salary": salary, "url": href, "source": "ZipRecruiter",
         })
     return jobs
-
 
 def scrape_ziprecruiter(role: str, location: str, max_pages=5) -> list[dict]:
     jobs = _paginated_scrape(
@@ -1106,6 +1146,7 @@ def run_scrape(
     location: str = "Hyderabad",
     sources: Optional[list[str]] = None,
     on_batch=None,
+    deep: bool = False,
 ) -> list[dict]:
     active = sources or list(SCRAPERS.keys())
     seen: set[str] = set()
@@ -1118,7 +1159,10 @@ def run_scrape(
             continue
         try:
             logger.info(f"Starting {name} scrape")
-            batch = fn(role, location)
+            if name == "indeed":
+                batch = fn(role, location, deep=deep)
+            else:
+                batch = fn(role, location)
             new = [j for j in batch if j["url"] not in seen]
             seen.update(j["url"] for j in new)
             results.extend(new)

@@ -1,7 +1,7 @@
 """
 Job scraper — Dice, LinkedIn, Indeed, ZipRecruiter, RemoteOK, Glassdoor.
 
-Dice:         Playwright intercepts x-api-key once → httpx API calls
+Dice:         DICE_API_KEY env var (NEXT_PUBLIC key from JS bundle) → httpx API calls
 LinkedIn:     curl_cffi (Chrome TLS fingerprint) + Oxylabs sticky sessions
 Indeed:       PRIMARY: curl_cffi + Oxylabs residential (paginated, cookies)
               FALLBACK: Bright Data Web Unlocker (multi-query, no pagination)
@@ -545,57 +545,11 @@ def _paginated_scrape(
 #  DICE
 # ═══════════════════════════════════════════════════════════════════════
 
-_cached_dice_key: Optional[str] = None
-
 def _get_dice_key() -> str:
-    global _cached_dice_key
-    if _cached_dice_key:
-        return _cached_dice_key
-    try:
-        from playwright.sync_api import sync_playwright
-        key = None
-        def on_req(req):
-            nonlocal key
-            if key: return
-            if "dhigroupinc.com" in req.url.lower():
-                k = req.headers.get("x-api-key")
-                if k and len(k) >= 30: key = k
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context(
-                user_agent=random.choice(USER_AGENTS),
-                locale="en-US",
-                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-            )
-            page = ctx.new_page()
-            page.on("request", on_req)
-            # dismiss consent walls before the search fires
-            page.goto("https://www.dice.com/jobs?q=developer&location=United+States",
-                       wait_until="domcontentloaded", timeout=45000)
-            for selector in [
-                "button:has-text('Allow all')",
-                "button:has-text('Accept all')",
-                "button:has-text('Allow All')",
-                "button[id*='accept']",
-                "button[class*='accept']",
-            ]:
-                try:
-                    page.locator(selector).first.click(timeout=2000)
-                    break
-                except Exception:
-                    pass
-            page.wait_for_timeout(8000)
-            browser.close()
-        if key:
-            _cached_dice_key = key
-            return key
-    except Exception as e:
-        logger.warning(f"Dice key interception failed: {e}")
     key = os.getenv("DICE_API_KEY", "").strip()
-    if key:
-        _cached_dice_key = key
-        return key
-    raise RuntimeError("No Dice API key available. Set DICE_API_KEY or install playwright.")
+    if not key:
+        raise RuntimeError("DICE_API_KEY env var not set.")
+    return key
 
 
 def scrape_dice(role: str, location: str, max_pages=5) -> list[dict]:

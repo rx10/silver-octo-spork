@@ -147,7 +147,7 @@ def _zip_html(cards_html: str) -> BeautifulSoup:
 
 CARD_FULL = """
 <article class="job_result">
-  <h2 class="title"><a href="https://www.ziprecruiter.com/jobs/acme-123">Backend Engineer</a></h2>
+  <a class="job_link" href="https://www.ziprecruiter.com/jobs/acme-123">Backend Engineer</a>
   <a class="t_org_link">Acme Corp</a>
   <p class="location">Austin, TX</p>
   <span class="salary_text">$120,000/yr</span>
@@ -158,13 +158,13 @@ CARD_FULL = """
 
 CARD_MINIMAL = """
 <article class="job_result">
-  <h2 class="title"><a href="https://www.ziprecruiter.com/jobs/beta-456">Data Scientist</a></h2>
+  <a class="job_link" href="https://www.ziprecruiter.com/jobs/beta-456">Data Scientist</a>
 </article>
 """
 
 CARD_RELATIVE_URL = """
 <article class="job_result">
-  <h2 class="title"><a href="/jobs/gamma-789">DevOps Engineer</a></h2>
+  <a class="job_link" href="/jobs/gamma-789">DevOps Engineer</a>
   <a class="t_org_link">Gamma LLC</a>
 </article>
 """
@@ -198,7 +198,7 @@ class TestParseZipRecruiter(unittest.TestCase):
     def test_non_salary_text_excluded(self):
         html = """
         <article class="job_result">
-          <h2 class="title"><a href="https://www.ziprecruiter.com/jobs/x">Dev</a></h2>
+          <a class="job_link" href="https://www.ziprecruiter.com/jobs/x">Dev</a>
           <span class="salary_text">Competitive</span>
         </article>
         """

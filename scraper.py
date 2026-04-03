@@ -11,7 +11,7 @@ Glassdoor:    curl_cffi + Oxylabs proxy → HTML parse
 """
 
 import re, os, hashlib, random, string, time, logging, json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict
 from urllib.parse import quote_plus, quote, urlparse
 
@@ -166,7 +166,7 @@ def parse_date(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
     s = s.strip().lower()
-    today = datetime.utcnow().date()
+    today = datetime.now(timezone.utc).date()
     if any(w in s for w in ("today", "just", "hour", "moment")):
         return today.isoformat()
     if "yesterday" in s:
@@ -918,7 +918,7 @@ def _parse_ziprecruiter(soup: BeautifulSoup, fallback_loc: str) -> list[dict]:
     jobs = []
     cards = soup.select("article.job_result, div.job_result_two_pane, li[class*='job-listing'], div[data-testid='job-card']")
     for card in cards:
-        title_el = card.select_one("h2.title a, a.job_link, h2[class*='title'], a[data-testid='job-title']")
+        title_el = card.select_one("h2.title a, a[class*='job-link'], h2[class*='title'], a[data-testid='job-title']")
         if not title_el: continue
         href = title_el.get("href", "")
         if href.startswith("/"): href = f"https://www.ziprecruiter.com{href}"
@@ -946,7 +946,7 @@ def scrape_ziprecruiter(role: str, location: str, max_pages=5) -> list[dict]:
     jobs = _paginated_scrape(
         warmup_url="https://www.ziprecruiter.com/",
         url_fn=lambda pg: f"https://www.ziprecruiter.com/jobs-search?search={quote_plus(role)}&location={quote_plus(location)}&page={pg + 1}",
-        parse_fn=_parse_ziprecruiter, location=location, max_pages=max_pages,
+        parse_fn=_parse_ziprecruiter, location=location, max_pages=max_pages, country="US",
     )
     logger.info(f"ZipRecruiter total: {len(jobs)}")
     return jobs
@@ -980,7 +980,7 @@ def scrape_remoteok(role: str, location: str = "Remote", max_results=60) -> list
         elif sal_min: salary = f"USD {int(sal_min):,}+"
         posted = None
         if epoch := item.get("epoch"):
-            try: posted = datetime.utcfromtimestamp(int(epoch)).date().isoformat()
+            try: posted = datetime.fromtimestamp(int(epoch), timezone.utc).date().isoformat()
             except: pass
         jobs.append({
             "id": make_id(job_url), "title": title,

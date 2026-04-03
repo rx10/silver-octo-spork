@@ -565,8 +565,8 @@ def _get_dice_key() -> str:
             page = browser.new_page(user_agent=random.choice(USER_AGENTS))
             page.on("request", on_req)
             page.goto("https://www.dice.com/jobs?q=developer&location=United+States",
-                       wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(4000)
+                       wait_until="networkidle", timeout=45000)
+            page.wait_for_timeout(6000)
             browser.close()
         if key:
             _cached_dice_key = key

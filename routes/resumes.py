@@ -12,7 +12,12 @@ from sqlalchemy.orm import Session
 from auth import get_current_user
 from database import get_db
 from models import Job, Resume, User, UserProfile
-from schemas import ResumeCreate, ResumeOut, ResumeUpdate
+from schemas import (
+    ResumeCreate,
+    ResumeGenerateRequest,
+    ResumeOut,
+    ResumeUpdate,
+)
 from services.ai import generate_resume
 from services.pdf import generate_pdf
 
@@ -38,8 +43,8 @@ def _get_resume_or_404(resume_id: str, user_id: str, db: Session) -> Resume:
 def _build_profile_dict(user: User, profile: UserProfile | None) -> dict:
     """Merge User + UserProfile into a single dict for the AI service."""
     d: dict = {
-        "full_name":  user.full_name,
-        "email":      user.email,
+        "full_name": user.full_name,
+        "email":     user.email,
     }
     if profile:
         d.update({
@@ -88,6 +93,66 @@ def create_resume(
     return resume
 
 
+@router.post("/generate", response_model=ResumeOut, status_code=status.HTTP_201_CREATED)
+async def generate_resume_endpoint(
+    body: ResumeGenerateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    One-shot resume generation: accepts a full profile + job description inline,
+    calls Claude, verifies entities, and returns the tailored resume.
+
+    The generated resume is persisted to the database and available via
+    GET /api/v1/resumes/{id} and GET /api/v1/resumes/{id}/pdf.
+    """
+    with sentry_sdk.start_transaction(op="resume.generate", name="Generate Resume"):
+        sentry_sdk.set_user({"id": current_user.id, "email": current_user.email})
+
+        # Build profile dict from the inline input
+        p = body.profile
+        profile_dict: dict = {
+            "full_name":     p.personal.full_name,
+            "email":         p.personal.email,
+            "phone":         p.personal.phone,
+            "location":      p.personal.location,
+            "linkedin_url":  p.personal.linkedin_url,
+            "portfolio_url": p.personal.portfolio_url,
+            "work_experience": [e.model_dump() for e in p.work_experience],
+            "education":       [e.model_dump() for e in p.education],
+            "skills":          p.skills,
+            "certifications":  p.certifications,
+        }
+
+        try:
+            resume_data = await generate_resume(
+                profile=profile_dict,
+                job_description=body.job_description or "",
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("Unexpected error during resume generation")
+            sentry_sdk.capture_exception(exc)
+            raise HTTPException(status_code=502, detail="AI generation failed. Please try again.")
+
+        resume_id = str(uuid.uuid4())
+        resume = Resume(
+            id=resume_id,
+            user_id=current_user.id,
+            resume_data=resume_data,
+            template_id=body.template_id,
+            version=1,
+            status="generated",
+        )
+        db.add(resume)
+        db.commit()
+        db.refresh(resume)
+
+        logger.info("Resume generated — user=%s resume=%s", current_user.id, resume_id)
+        return resume
+
+
 @router.get("/{resume_id}", response_model=ResumeOut)
 def get_resume(
     resume_id: str,
@@ -125,23 +190,19 @@ async def regenerate_resume(
     db: Session = Depends(get_db),
 ):
     """
-    Call Claude to (re)generate the resume content from the user's profile
-    and the linked job description. Bumps version on each call.
+    Re-generate resume content from the user's stored profile and the linked job.
+    Bumps version on each call.
     """
-    with sentry_sdk.start_transaction(op="resume.generate", name="Regenerate Resume"):
+    with sentry_sdk.start_transaction(op="resume.regenerate", name="Regenerate Resume"):
         sentry_sdk.set_user({"id": current_user.id, "email": current_user.email})
         sentry_sdk.set_tag("resume_id", resume_id)
 
         logger.info("Resume regeneration started — user=%s resume=%s", current_user.id, resume_id)
 
-        resume = _get_resume_or_404(resume_id, current_user.id, db)
-
-        # Fetch profile
+        resume  = _get_resume_or_404(resume_id, current_user.id, db)
         profile = db.query(UserProfile).filter(UserProfile.user_id == current_user.id).first()
         profile_dict = _build_profile_dict(current_user, profile)
-        sentry_sdk.set_tag("has_profile", profile is not None)
 
-        # Fetch job if linked
         job_dict = None
         if resume.job_id:
             job = db.query(Job).filter(Job.id == resume.job_id).first()
@@ -151,10 +212,11 @@ async def regenerate_resume(
                     "company":     job.company,
                     "description": job.description,
                 }
-        sentry_sdk.set_tag("has_job", job_dict is not None)
 
         try:
-            new_data = await generate_resume(profile_dict, job_dict)
+            new_data = await generate_resume(profile=profile_dict, job=job_dict)
+        except HTTPException:
+            raise
         except Exception as exc:
             logger.exception("Claude generation failed — resume=%s", resume_id)
             sentry_sdk.capture_exception(exc)
@@ -184,13 +246,24 @@ def download_pdf(
     if not resume.resume_data:
         raise HTTPException(
             status_code=400,
-            detail="Resume has no content yet. Run /regenerate first.",
+            detail="Resume has no content yet. Run /generate or /regenerate first.",
         )
 
-    user_dict = {"full_name": current_user.full_name, "email": current_user.email}
-    pdf_bytes = generate_pdf(resume.resume_data, user_dict)
+    # Fetch profile for richer contact header
+    profile = db.query(UserProfile).filter(UserProfile.user_id == current_user.id).first()
+    personal = {
+        "full_name":    current_user.full_name,
+        "email":        current_user.email,
+        "phone":        None,
+        "location":     None,
+        "linkedin_url": None,
+    }
+    # UserProfile doesn't store contact info — only what's in User is available here.
+    # The /generate endpoint path stores nothing to DB about contact details,
+    # so we use what we have from the authenticated user.
 
-    filename = f"resume_v{resume.version}.pdf"
+    pdf_bytes = generate_pdf(resume.resume_data, personal)
+    filename  = f"resume_v{resume.version}.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",

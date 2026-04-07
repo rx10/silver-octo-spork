@@ -119,6 +119,47 @@ class PreferencesUpdate(BaseModel):
     is_auto_apply:    Optional[bool]      = None
 
 
+# ── Resume Generation (inline profile + JD) ──────────────────────────────────
+
+class PersonalInfoInput(BaseModel):
+    full_name:     str
+    email:         str
+    phone:         Optional[str] = None
+    location:      Optional[str] = None
+    linkedin_url:  Optional[str] = None
+    portfolio_url: Optional[str] = None
+
+
+class WorkExpGenerateInput(BaseModel):
+    company:    str
+    title:      str
+    start_date: Optional[str]  = None
+    end_date:   Optional[str]  = None
+    bullets:    list[str]      = []
+
+
+class EducationGenerateInput(BaseModel):
+    school:    str
+    degree:    str
+    field:     Optional[str] = None
+    year:      Optional[str] = None
+    gpa:       Optional[str] = None
+
+
+class ProfileGenerateInput(BaseModel):
+    personal:        PersonalInfoInput
+    education:       list[EducationGenerateInput]  = []
+    work_experience: list[WorkExpGenerateInput]    = []
+    skills:          list[str]                     = []
+    certifications:  list[str]                     = []
+
+
+class ResumeGenerateRequest(BaseModel):
+    profile:         ProfileGenerateInput
+    job_description: Optional[str] = None
+    template_id:     str           = "classic"
+
+
 # ── Resumes ───────────────────────────────────────────────────────────────────
 
 class ResumeCreate(BaseModel):

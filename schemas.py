@@ -122,7 +122,7 @@ class PreferencesUpdate(BaseModel):
 # ── Resume Generation (inline profile + JD) ──────────────────────────────────
 
 class PersonalInfoInput(BaseModel):
-    full_name:     str
+    full_name:     Optional[str] = None
     email:         str
     phone:         Optional[str] = None
     location:      Optional[str] = None

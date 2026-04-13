@@ -1,8 +1,8 @@
 """
-Claude API integration — resume generation.
+Groq API integration — resume generation.
 
 Env vars required:
-  ANTHROPIC_API_KEY   — your Anthropic key
+  GROQ_API_KEY   — your Groq API key (free tier works)
 """
 
 import json
@@ -11,12 +11,13 @@ import os
 import re
 from typing import Optional
 
-import anthropic
+from groq import AsyncGroq
+import groq as groq_lib
 from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
-MODEL_RESUME = "claude-sonnet-4-6"
+MODEL_RESUME = "llama-3.3-70b-versatile"
 MAX_RETRIES  = 2
 MAX_JD_CHARS = 4000
 
@@ -234,15 +235,15 @@ async def generate_resume(
     job_description: str = "",
 ) -> dict:
     """
-    Call Claude to produce a tailored resume JSON.
+    Call Groq to produce a tailored resume JSON.
 
     profile         — merged dict from User + UserProfile rows
     job             — Job row dict {title, company, description} (optional)
     job_description — raw JD text string (takes priority over job dict)
     """
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured")
 
     # Resolve JD text — inline string wins, then job dict description
     raw_jd = job_description or (job or {}).get("description", "")
@@ -252,7 +253,7 @@ async def generate_resume(
         raw_jd = header + raw_jd
     cleaned_jd = clean_jd(raw_jd) if raw_jd else ""
 
-    client     = anthropic.AsyncAnthropic(api_key=api_key)
+    client      = AsyncGroq(api_key=api_key)
     base_prompt = _build_prompt(profile, cleaned_jd)
 
     last_error: Optional[Exception] = None
@@ -265,18 +266,20 @@ async def generate_resume(
             )
 
         try:
-            message = await client.messages.create(
+            response = await client.chat.completions.create(
                 model=MODEL_RESUME,
                 max_tokens=4096,
                 temperature=0.3,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": prompt},
+                ],
             )
-        except anthropic.APIError as e:
-            logger.error("Anthropic API error: %s", e)
+        except groq_lib.APIError as e:
+            logger.error("Groq API error: %s", e)
             raise HTTPException(status_code=502, detail=f"AI service error: {e}")
 
-        raw = message.content[0].text.strip()
+        raw = response.choices[0].message.content.strip()
 
         # Strip markdown code fences if present
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -288,12 +291,12 @@ async def generate_resume(
             logger.info(
                 "Resume generation OK — attempt=%d in=%d out=%d",
                 attempt + 1,
-                message.usage.input_tokens,
-                message.usage.output_tokens,
+                response.usage.prompt_tokens,
+                response.usage.completion_tokens,
             )
             return data
         except json.JSONDecodeError as exc:
-            logger.warning("Attempt %d — invalid JSON from Claude: %s", attempt + 1, exc)
+            logger.warning("Attempt %d — invalid JSON from Groq: %s", attempt + 1, exc)
             last_error = exc
 
     raise HTTPException(
